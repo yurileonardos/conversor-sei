@@ -31,14 +31,14 @@ hide_streamlit_style = """
                 z-index: 999;
             }
             .stFileUploader label {
+                 font-size: 18px;
                  font-weight: bold;
             }
-            /* Estilo para as caixas de instrução */
-            .instruction-box {
-                background-color: #f0f2f6;
+            /* Aumenta a área de upload visualmente para facilitar o "arrastar" */
+            .stFileUploader {
                 padding: 20px;
                 border-radius: 10px;
-                margin-top: 20px;
+                border: 2px dashed #cccccc;
             }
             </style>
             """
@@ -57,18 +57,25 @@ a fim de inseri-las no documento SEI: **ATA DE REGISTRO DE PREÇOS**.
 """)
 
 # Aviso sobre a extensão e links
-st.info("""
-Vale ressaltar que essa funcionalidade só está presente na extensão 
-[**SEI PRO**](https://sei-pro.github.io/sei-pro/), utilizando a função 
-[**INSERIR CONTEÚDO EXTERNO**](https://sei-pro.github.io/sei-pro/pages/INSERIRDOC.html).
-""")
+col1, col2 = st.columns([0.1, 0.9])
+with col1:
+    try:
+        st.image("icone_sei.png", width=40)
+    except:
+        st.write("🧩")
+with col2:
+    st.info("""
+    Funcionalidade disponível na extensão [**SEI PRO**](https://sei-pro.github.io/sei-pro/), 
+    utilizando a ferramenta [**INSERIR CONTEÚDO EXTERNO**](https://sei-pro.github.io/sei-pro/pages/INSERIRDOC.html).
+    """)
 
 st.write("---")
 
-# --- UPLOAD ---
+# --- PASSO 1: UPLOAD (COM TEXTO EXPLÍCITO DE ARRASTAR) ---
 st.write("### Passo 1: Upload dos Arquivos")
+
 uploaded_files = st.file_uploader(
-    "Selecione ou arraste seus arquivos PDF (um ou vários):", 
+    "Arraste e solte seus arquivos PDF aqui (ou clique para buscar):", 
     type="pdf", 
     accept_multiple_files=True
 )
@@ -104,16 +111,17 @@ def convert_pdf_to_docx(file_bytes):
     docx_io.seek(0)
     return docx_io
 
-# --- PROCESSAMENTO ---
+# --- PASSO 2: CONVERTER E DOWNLOAD (UNIFICADOS) ---
 if uploaded_files:
     st.write("---")
-    st.write("### Passo 2: Conversão")
+    st.write("### Passo 2: Converter e Download")
     
     qtd = len(uploaded_files)
-    st.caption(f"{qtd} arquivo(s) selecionado(s).")
+    st.caption(f"{qtd} arquivo(s) na fila para processamento.")
 
-    if st.button(f"🚀 Iniciar Conversão ({qtd} arquivos)"):
-        with st.spinner('Processando... Isso pode levar alguns instantes.'):
+    # Botão Único de Ação
+    if st.button(f"🚀 Processar Arquivos e Gerar Download"):
+        with st.spinner('Otimizando imagens e gerando documentos...'):
             try:
                 processed_files = []
                 progress_bar = st.progress(0)
@@ -124,14 +132,14 @@ if uploaded_files:
                     processed_files.append((file_name, docx_data))
                     progress_bar.progress((index + 1) / qtd)
 
-                st.success("✅ Todos os arquivos foram convertidos!")
-                st.write("### Passo 3: Download")
-                st.caption("O local de salvamento depende das configurações do seu navegador.")
-
+                # Sucesso
+                st.success("✅ Conversão finalizada!")
+                
+                # Exibição IMEDIATA do botão de download
                 if len(processed_files) == 1:
                     name, data = processed_files[0]
                     st.download_button(
-                        label=f"📥 Baixar {name}",
+                        label=f"📥 Clique aqui para Baixar {name}",
                         data=data,
                         file_name=name,
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -143,7 +151,7 @@ if uploaded_files:
                             zf.writestr(name, data.getvalue())
                     zip_buffer.seek(0)
                     st.download_button(
-                        label="📥 Baixar Todos (Arquivo .ZIP)",
+                        label="📥 Clique aqui para Baixar Todos (.ZIP)",
                         data=zip_buffer,
                         file_name="Documentos_SEI_Convertidos.zip",
                         mime="application/zip"
@@ -152,37 +160,33 @@ if uploaded_files:
             except Exception as e:
                 st.error(f"Erro ao processar: {e}")
 
-# --- GUIA VISUAL (NOVA SEÇÃO) ---
+# --- GUIA VISUAL ---
 st.write("---")
 st.subheader("📚 Guia Rápido: Como inserir no SEI")
 
-# Instrução 1: O ícone
 col1, col2 = st.columns([0.15, 0.85])
 with col1:
     try:
-        # Exibe o ícone
         st.image("icone_sei.png", width=50) 
     except:
-        st.write("🧩") # Emoji caso a imagem falhe
+        st.write("🧩")
 with col2:
     st.markdown("""
     **1º Localize o ícone:** No editor do SEI, clique no botão da função **INSERIR CONTEÚDO EXTERNO** (representado pelo ícone ao lado).
     """)
 
-st.write("") # Espaço em branco
+st.write("")
 
-# Instrução 2: O Print da tela
 st.markdown("""
 **2º Configure a inserção:** Na janela que abrir, faça o upload do arquivo Word gerado aqui.
 """)
 
-# Aviso importante em vermelho/amarelo
 st.warning("⚠️ **IMPORTANTE:** Certifique-se de deixar todas as caixas de seleção **DESMARCADAS** (como na imagem abaixo) para evitar que o arquivo substitua o conteúdo existente no documento.")
 
 try:
     st.image("print_sei.png", caption="Exemplo: Deixe as opções desmarcadas.", use_container_width=True)
 except:
-    st.write("[Imagem explicativa não encontrada]")
+    pass
 
 # --- RODAPÉ ---
-st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v3.0</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v4.0</div>', unsafe_allow_html=True)
