@@ -33,6 +33,13 @@ hide_streamlit_style = """
             .stFileUploader label {
                  font-weight: bold;
             }
+            /* Estilo para as caixas de instrução */
+            .instruction-box {
+                background-color: #f0f2f6;
+                padding: 20px;
+                border-radius: 10px;
+                margin-top: 20px;
+            }
             </style>
             """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
@@ -43,30 +50,22 @@ st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 # --- TÍTULO PRINCIPAL ---
 st.title("📑 SEI Converter ATA - SGB")
 
-# --- INSTRUÇÕES (Link removido da ATA) ---
+# --- INTRODUÇÃO ---
 st.markdown("""
 Converta documentos PDF de **TR (Termo de Referência)** e **Proposta de Preços** em imagens otimizadas, 
 a fim de inseri-las no documento SEI: **ATA DE REGISTRO DE PREÇOS**.
 """)
 
-# --- LINKS REPOSICIONADOS AQUI ---
-col1, col2 = st.columns([0.1, 0.9])
-with col1:
-    try:
-        st.image("icone_sei.png", width=40)
-    except:
-        st.write("🧩")
-with col2:
-    # Link do SEI PRO movido para cá + Novo link do Inserir Conteúdo
-    st.info("""
-    Vale ressaltar que essa funcionalidade de inserir o DOCX gerado só está presente na extensão 
-    [**SEI PRO**](https://sei-pro.github.io/sei-pro/), utilizando a função 
-    [**"Inserir Conteúdo Externo"**](https://sei-pro.github.io/sei-pro/pages/INSERIRDOC.html).
-    """)
+# Aviso sobre a extensão e links
+st.info("""
+Vale ressaltar que essa funcionalidade só está presente na extensão 
+[**SEI PRO**](https://sei-pro.github.io/sei-pro/), utilizando a função 
+[**INSERIR CONTEÚDO EXTERNO**](https://sei-pro.github.io/sei-pro/pages/INSERIRDOC.html).
+""")
 
 st.write("---")
 
-# --- UPLOAD DE MÚLTIPLOS ARQUIVOS ---
+# --- UPLOAD ---
 st.write("### Passo 1: Upload dos Arquivos")
 uploaded_files = st.file_uploader(
     "Selecione ou arraste seus arquivos PDF (um ou vários):", 
@@ -74,7 +73,7 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-# FUNÇÃO DE CONVERSÃO
+# --- FUNÇÃO DE CONVERSÃO ---
 def convert_pdf_to_docx(file_bytes):
     images = convert_from_bytes(file_bytes)
     doc = Document()
@@ -100,7 +99,6 @@ def convert_pdf_to_docx(file_bytes):
         doc.add_picture(img_byte_arr, width=Cm(19.0))
         doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
     
-    # Salvar em memória
     docx_io = BytesIO()
     doc.save(docx_io)
     docx_io.seek(0)
@@ -124,7 +122,6 @@ if uploaded_files:
                     docx_data = convert_pdf_to_docx(uploaded_file.read())
                     file_name = uploaded_file.name.replace('.pdf', '') + "_SEI_SGB.docx"
                     processed_files.append((file_name, docx_data))
-                    
                     progress_bar.progress((index + 1) / qtd)
 
                 st.success("✅ Todos os arquivos foram convertidos!")
@@ -144,9 +141,7 @@ if uploaded_files:
                     with zipfile.ZipFile(zip_buffer, "w") as zf:
                         for name, data in processed_files:
                             zf.writestr(name, data.getvalue())
-                    
                     zip_buffer.seek(0)
-                    
                     st.download_button(
                         label="📥 Baixar Todos (Arquivo .ZIP)",
                         data=zip_buffer,
@@ -157,5 +152,37 @@ if uploaded_files:
             except Exception as e:
                 st.error(f"Erro ao processar: {e}")
 
+# --- GUIA VISUAL (NOVA SEÇÃO) ---
+st.write("---")
+st.subheader("📚 Guia Rápido: Como inserir no SEI")
+
+# Instrução 1: O ícone
+col1, col2 = st.columns([0.15, 0.85])
+with col1:
+    try:
+        # Exibe o ícone
+        st.image("icone_sei.png", width=50) 
+    except:
+        st.write("🧩") # Emoji caso a imagem falhe
+with col2:
+    st.markdown("""
+    **1º Localize o ícone:** No editor do SEI, clique no botão da função **INSERIR CONTEÚDO EXTERNO** (representado pelo ícone ao lado).
+    """)
+
+st.write("") # Espaço em branco
+
+# Instrução 2: O Print da tela
+st.markdown("""
+**2º Configure a inserção:** Na janela que abrir, faça o upload do arquivo Word gerado aqui.
+""")
+
+# Aviso importante em vermelho/amarelo
+st.warning("⚠️ **IMPORTANTE:** Certifique-se de deixar todas as caixas de seleção **DESMARCADAS** (como na imagem abaixo) para evitar que o arquivo substitua o conteúdo existente no documento.")
+
+try:
+    st.image("print_sei.png", caption="Exemplo: Deixe as opções desmarcadas.", use_container_width=True)
+except:
+    st.write("[Imagem explicativa não encontrada]")
+
 # --- RODAPÉ ---
-st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v2.1</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v3.0</div>', unsafe_allow_html=True)
