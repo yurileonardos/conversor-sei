@@ -34,7 +34,6 @@ hide_streamlit_style = """
                  font-size: 18px;
                  font-weight: bold;
             }
-            /* Aumenta a área de upload visualmente para facilitar o "arrastar" */
             .stFileUploader {
                 padding: 20px;
                 border-radius: 10px;
@@ -43,9 +42,6 @@ hide_streamlit_style = """
             </style>
             """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
-
-# --- (LOGO OPCIONAL) ---
-# st.image("logo.png", width=200) 
 
 # --- TÍTULO PRINCIPAL ---
 st.title("📑 SEI Converter ATA - SGB")
@@ -56,7 +52,6 @@ Converta documentos PDF de **TR (Termo de Referência)** e **Proposta de Preços
 a fim de inseri-las no documento SEI: **ATA DE REGISTRO DE PREÇOS**.
 """)
 
-# Aviso sobre a extensão e links
 col1, col2 = st.columns([0.1, 0.9])
 with col1:
     try:
@@ -69,9 +64,22 @@ with col2:
     utilizando a ferramenta [**INSERIR CONTEÚDO EXTERNO**](https://sei-pro.github.io/sei-pro/pages/INSERIRDOC.html).
     """)
 
+# --- DICA DE CONFIGURAÇÃO (SOLUÇÃO PARA A PASTA DE DOWNLOAD) ---
+with st.expander("⚙️ Deseja escolher a pasta onde o arquivo será salvo? Clique aqui."):
+    st.markdown("""
+    Por segurança, os navegadores salvam automaticamente na pasta "Downloads". 
+    Para escolher a pasta (Ex: Área de Trabalho) a cada download, configure seu navegador:
+    
+    **No Google Chrome / Edge:**
+    1. Vá em **Configurações** > **Downloads**.
+    2. Ative a opção: **"Perguntar onde salvar cada arquivo antes de fazer download"**.
+    
+    *Após ativar isso, sempre que clicar em Baixar, uma janela abrirá para você escolher o local.*
+    """)
+
 st.write("---")
 
-# --- PASSO 1: UPLOAD (COM TEXTO EXPLÍCITO DE ARRASTAR) ---
+# --- PASSO 1: UPLOAD ---
 st.write("### Passo 1: Upload dos Arquivos")
 
 uploaded_files = st.file_uploader(
@@ -85,7 +93,6 @@ def convert_pdf_to_docx(file_bytes):
     images = convert_from_bytes(file_bytes)
     doc = Document()
     
-    # Margens
     section = doc.sections[0]
     section.page_height = Cm(29.7)
     section.page_width = Cm(21.0)
@@ -111,17 +118,17 @@ def convert_pdf_to_docx(file_bytes):
     docx_io.seek(0)
     return docx_io
 
-# --- PASSO 2: CONVERTER E DOWNLOAD (UNIFICADOS) ---
+# --- PASSO 2: CONVERTER E DOWNLOAD ---
 if uploaded_files:
     st.write("---")
     st.write("### Passo 2: Converter e Download")
     
     qtd = len(uploaded_files)
-    st.caption(f"{qtd} arquivo(s) na fila para processamento.")
+    st.caption(f"{qtd} arquivo(s) pronto(s) para conversão.")
 
-    # Botão Único de Ação
-    if st.button(f"🚀 Processar Arquivos e Gerar Download"):
-        with st.spinner('Otimizando imagens e gerando documentos...'):
+    # Botão de Ação
+    if st.button(f"🚀 Processar Arquivos"):
+        with st.spinner('Otimizando imagens...'):
             try:
                 processed_files = []
                 progress_bar = st.progress(0)
@@ -132,17 +139,18 @@ if uploaded_files:
                     processed_files.append((file_name, docx_data))
                     progress_bar.progress((index + 1) / qtd)
 
-                # Sucesso
-                st.success("✅ Conversão finalizada!")
+                st.success("✅ Sucesso! Clique abaixo para salvar.")
                 
-                # Exibição IMEDIATA do botão de download
+                # Exibição do botão de download
                 if len(processed_files) == 1:
                     name, data = processed_files[0]
+                    # KEY é importante para não recarregar a página errada
                     st.download_button(
-                        label=f"📥 Clique aqui para Baixar {name}",
+                        label=f"📥 Salvar {name} no Computador",
                         data=data,
                         file_name=name,
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key="btn_download"
                     )
                 else:
                     zip_buffer = BytesIO()
@@ -151,10 +159,11 @@ if uploaded_files:
                             zf.writestr(name, data.getvalue())
                     zip_buffer.seek(0)
                     st.download_button(
-                        label="📥 Clique aqui para Baixar Todos (.ZIP)",
+                        label="📥 Salvar Todos (.ZIP) no Computador",
                         data=zip_buffer,
                         file_name="Documentos_SEI_Convertidos.zip",
-                        mime="application/zip"
+                        mime="application/zip",
+                        key="btn_download_zip"
                     )
 
             except Exception as e:
@@ -181,7 +190,7 @@ st.markdown("""
 **2º Configure a inserção:** Na janela que abrir, faça o upload do arquivo Word gerado aqui.
 """)
 
-st.warning("⚠️ **IMPORTANTE:** Certifique-se de deixar todas as caixas de seleção **DESMARCADAS** (como na imagem abaixo) para evitar que o arquivo substitua o conteúdo existente no documento.")
+st.warning("⚠️ **IMPORTANTE:** Certifique-se de deixar todas as caixas de seleção **DESMARCADAS** (como na imagem abaixo).")
 
 try:
     st.image("print_sei.png", caption="Exemplo: Deixe as opções desmarcadas.", use_container_width=True)
@@ -189,4 +198,4 @@ except:
     pass
 
 # --- RODAPÉ ---
-st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v4.0</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v5.0</div>', unsafe_allow_html=True)
