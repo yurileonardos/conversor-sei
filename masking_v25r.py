@@ -72,24 +72,34 @@ def find_x_by_visual_scan(pdf_page):
 # ==========================
 
 def find_x_by_header_scan(pdf_page):
+    """
+    Detecta o início das colunas de preço a partir do cabeçalho,
+    mesmo quando o texto está fragmentado em várias células.
+    """
     words = pdf_page.extract_words()
+    hits = []
 
     headers = [
+        "preço", "preco",
         "unitário", "unitario",
-        "preço unitário", "preco unitario",
-        "valor unitário", "valor total",
-        "total (r$", "r$"
+        "valor", "total",
+        "(r$", "r$"
     ]
 
-    candidates = []
-
     for w in words:
-        txt = w["text"].lower()
+        txt = w["text"].lower().strip()
         if any(h in txt for h in headers):
+            # somente metade direita da página
             if w["x0"] > pdf_page.width * 0.45:
-                candidates.append(w["x0"])
+                hits.append(w["x0"])
 
-    return min(candidates) if candidates else None
+    if not hits:
+        return None
+
+    # 🔑 REGRA CRÍTICA:
+    # início da área de preços = menor X detectado
+    return min(hits)
+
 def has_price_header(pdf_page):
     """
     Detecta cabeçalho de colunas de preço,
