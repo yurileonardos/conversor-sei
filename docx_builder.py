@@ -4,7 +4,9 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Cm
 from constants import *
 from masking import apply_masking
+from pdf_utils import pdf_to_images 
 import pdfplumber
+
 
 def build_docx(tr_bytes, proposal_files, debug=False):
     doc = Document()
