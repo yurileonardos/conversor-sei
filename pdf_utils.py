@@ -1,22 +1,20 @@
-import fitz  # PyMuPDF
-from PIL import Image
+from pdf2image import convert_from_bytes
+import pdfplumber
 from io import BytesIO
 
 
-def pdf_to_images(pdf_bytes, dpi=200):
+def pdf_to_images(pdf_bytes, return_pages=False):
     """
-    Converte PDF em lista de imagens PIL
-    Compatível com Streamlit Cloud (sem poppler)
+    Converte PDF em imagens.
+    Se return_pages=True, retorna também as páginas do pdfplumber.
     """
-    images = []
 
-    pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
-    zoom = dpi / 72
-    mat = fitz.Matrix(zoom, zoom)
+    images = convert_from_bytes(pdf_bytes)
 
-    for page in pdf:
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = Image.open(BytesIO(pix.tobytes("png"))).convert("RGB")
-        images.append(img)
+    if not return_pages:
+        return images
 
-    return images
+    pdf = pdfplumber.open(BytesIO(pdf_bytes))
+    pages = pdf.pages
+
+    return images, pages
