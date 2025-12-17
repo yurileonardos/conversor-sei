@@ -6,31 +6,13 @@ from pdf_utils import pdf_to_images
 from masking_v25r import apply_masking_v25r
 
 
-
 def build_docx(tr_bytes, proposal_files, debug=False):
-    """
-    Garante:
-    - TR sempre primeiro
-    - Máscara apenas no TR
-    - Propostas nunca mascaradas
-    """
-
     doc = Document()
-
     _configure_page(doc)
 
-    # ==========================
-    # PROCESSA TERMO DE REFERÊNCIA
-    # ==========================
+    # ===== TR SEMPRE PRIMEIRO =====
     tr_images = _process_tr(tr_bytes, debug)
 
-    state = {"active": False, "cut_x": None}
-
-    for page, img in zip(pdf_pages, images):
-        img, state = apply_masking_v25r(img, page, state, debug=false)
-        processed.append(img)
-
-    
     if not tr_images:
         raise RuntimeError("Nenhuma página gerada para o Termo de Referência.")
 
@@ -38,21 +20,17 @@ def build_docx(tr_bytes, proposal_files, debug=False):
         _add_image(doc, img)
         doc.add_page_break()
 
-    # ==========================
-    # PROCESSA PROPOSTAS
-    # ==========================
-    for proposal_bytes in proposal_files:
-        proposal_images = pdf_to_images(proposal_bytes)
-
-        for img in proposal_images:
+    # ===== PROPOSTAS (SEM MÁSCARA) =====
+    for proposal in proposal_files:
+        images = pdf_to_images(proposal)
+        for img in images:
             _add_image(doc, img)
             doc.add_page_break()
 
-    # Remove quebra final extra
+    # remove quebra extra
     if doc.paragraphs:
-        doc.paragraphs[-1]._element.getparent().remove(
-            doc.paragraphs[-1]._element
-        )
+        p = doc.paragraphs[-1]
+        p._element.getparent().remove(p._element)
 
     output = BytesIO()
     doc.save(output)
@@ -60,25 +38,20 @@ def build_docx(tr_bytes, proposal_files, debug=False):
     return output
 
 
-# ==========================
-# FUNÇÕES AUXILIARES
-# ==========================
-
 def _process_tr(pdf_bytes, debug):
-    images = pdf_to_images(pdf_bytes)
+    images, pages = pdf_to_images(pdf_bytes, return_pages=True)
     processed = []
 
-   state = {"active": False, "cut_x": None}
+    state = {"active": False, "cut_x": None}
 
-for pdf_page, img in zip(pdf_pages, images):
-    img, state = apply_masking_v25r(
-        image=img,
-        pdf_page=pdf_page,
-        state=state,
-        debug=debug
-    )
-    processed.append(img)
-
+    for img, page in zip(images, pages):
+        img, state = apply_masking_v25r(
+            image=img,
+            pdf_page=page,
+            state=state,
+            debug=debug
+        )
+        processed.append(img)
 
     return processed
 
