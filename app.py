@@ -6,7 +6,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from io import BytesIO
 import zipfile
 import pdfplumber
-from PIL import ImageDraw
+from PIL import Image, ImageDraw
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
@@ -14,6 +14,9 @@ st.set_page_config(
     page_icon="📑",
     layout="centered"
 )
+
+# --- CONFIGURAÇÃO DE DIAGNÓSTICO (Mude para False para versão final) ---
+DEBUG_MODE = True  # True = Máscara Vermelha (Teste) | False = Máscara Branca (Final)
 
 # --- ESTILO CSS ---
 hide_streamlit_style = """
@@ -48,6 +51,9 @@ st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 # --- TÍTULO PRINCIPAL ---
 st.title("📑 SEI Converter ATA - SGB")
 
+if DEBUG_MODE:
+    st.warning("🔴 MODO DIAGNÓSTICO ATIVADO: As máscaras serão VERMELHAS para visualização. Para versão final, altere `DEBUG_MODE = False` no código.")
+
 st.markdown("""
 Converta documentos PDF de **TR (Termo de Referência)** e **Proposta de Preços** em imagens otimizadas, 
 a fim de inseri-las no documento SEI: **ATA DE REGISTRO DE PREÇOS**.
@@ -57,10 +63,8 @@ a fim de inseri-las no documento SEI: **ATA DE REGISTRO DE PREÇOS**.
 def clean_text(text):
     if not text: return ""
     text = text.lower().strip()
-    # Remove pontuação básica
     for ch in ['.', ':', '-', '/']:
         text = text.replace(ch, '')
-    # Remove acentos
     replacements = {
         'ç': 'c', 'ã': 'a', 'á': 'a', 'à': 'a', 'é': 'e', 'ê': 'e', 
         'í': 'i', 'ó': 'o', 'õ': 'o', 'ú': 'u'
@@ -69,50 +73,50 @@ def clean_text(text):
         text = text.replace(k, v)
     return text
 
-# --- FUNÇÃO DE MASCARAMENTO (v18.0 - SHAPE & CONTEXT LOCK) ---
-def apply_masking_v18(image, pdf_page, mask_state):
-    """
-    mask_state:
-      'active': bool (Máscara ligada?)
-      'mask_x': float (Posição do corte)
-      'ref_cols': int (Número de colunas da tabela de itens original)
-      'last_bbox': list (Geometria anterior)
-    """
+# --- FUNÇÃO DE MASCARAMENTO (v19.0 - HYBRID SCAN & RED MASK) ---
+def apply_masking_v19(image, pdf_page, mask_state):
     
-    # Busca tabelas
+    # 1. Tenta achar tabelas com LINHAS
     tables = pdf_page.find_tables(table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"})
-    if not tables:
-        tables = pdf_page.find_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
+    strategy_used = "lines"
 
-    draw = ImageDraw.Draw(image)
+    # PALAVRAS-CHAVE
+    keys_qty = ["qtde", "qtd", "quantidade", "quant", "unid", "consumo", "catmat"] # Adicionei Catmat como tentativa de pegar cabeçalho
+    keys_price = ["preco", "unitario", "estimado", "valor", "total", "maximo"]
+    
+    # Verificação Rápida: Se a estratégia 'lines' não achou nada relevante, tenta 'text'
+    # Isso resolve o caso onde o Grupo 1 não tem bordas detectáveis
+    found_relevant_table = False
+    if tables:
+        for t in tables:
+            # Pega texto das primeiras linhas
+            txt = " ".join([clean_text(cell) for row in t.rows[:3] for cell in row.cells if cell])
+            if any(k in txt for k in keys_qty) or any(k in txt for k in keys_price):
+                found_relevant_table = True
+                break
+    
+    if not tables or not found_relevant_table:
+        # Fallback para estratégia de TEXTO (Visual)
+        tables = pdf_page.find_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
+        strategy_used = "text"
+
+    draw = ImageDraw.Draw(image, "RGBA") # Modo RGBA para transparência se necessário
     im_width, im_height = image.size
     scale_x = im_width / pdf_page.width
     scale_y = im_height / pdf_page.height
 
-    # --- DICIONÁRIOS DE PALAVRAS-CHAVE ---
-    # Start: Variações de Quantidade
-    keys_qty = ["qtde", "qtd", "quantidade", "quant", "unid", "consumo"]
-    
-    # Start Backup: Variações de Preço (caso Qtde falhe)
-    keys_price = ["preco", "unitario", "estimado", "valor", "total", "maximo"]
-    
-    # Stop: Termos que indicam Texto Jurídico/Cláusulas (Pág 7/8 Protection)
     keys_stop = [
         "local", "entrega", "prazo", "assinatura", "garantia", "marca", "fabricante", 
         "validade", "pagamento", "sancoes", "sançoes", "obrigacoes", "fiscalizacao", 
-        "gestao", "clausula", "vigencia", "recursos", "dotacao", "objeto", "condicoes"
+        "gestao", "clausula", "vigencia", "recursos", "dotacao", "condicoes"
     ]
 
     for table in tables:
         if not table.rows: continue
         
-        # --- ANÁLISE DE FORMA (SHAPE ANALYSIS) ---
-        # Calcula o nº máximo de colunas nesta tabela (ignora linhas mescladas como "Grupo 01")
         max_row_cols = max([len(r.cells) for r in table.rows])
         
-        # 1. PROTEÇÃO CONTRA TEXTO (Páginas 7 e 8)
-        # Se a máscara estava ativa numa tabela de itens (ex: 5 colunas) 
-        # e agora encontramos uma "tabela" de 1 ou 2 colunas, É TEXTO. PARAR.
+        # 1. PROTEÇÃO CONTRA TEXTO (Páginas 7/8)
         if mask_state['active'] and mask_state['ref_cols'] >= 3 and max_row_cols < 3:
             mask_state = {'active': False, 'mask_x': None, 'ref_cols': 0, 'last_bbox': None}
             continue
@@ -121,7 +125,6 @@ def apply_masking_v18(image, pdf_page, mask_state):
         found_new_cut_x = None
         found_stopper = False
         
-        # Varre até 8 linhas (para pular "Grupo 01", "Processo", etc e achar o Item)
         scan_limit = min(8, len(table.rows))
         
         for row_idx in range(scan_limit):
@@ -132,19 +135,17 @@ def apply_masking_v18(image, pdf_page, mask_state):
                     cropped = pdf_page.crop(cell)
                     text = clean_text(cropped.extract_text())
                     
-                    # A) VERIFICAR STOPPER
+                    # STOPPER
                     if any(k in text for k in keys_stop):
                         found_stopper = True
                         break
 
-                    # B) VERIFICAR START (Quantidade - Borda Direita)
-                    # Verifica match exato ou palavra contida
+                    # START (Quantidade - Borda Direita)
                     if any(k == text or k in text.split() for k in keys_qty):
                         found_new_cut_x = cell[2]
                     
-                    # C) VERIFICAR START BACKUP (Preço - Borda Esquerda)
+                    # START BACKUP (Preço - Borda Esquerda)
                     elif found_new_cut_x is None and any(k in text for k in keys_price):
-                         # Só aceita se estiver na metade direita da página
                          if cell[0] > (pdf_page.width * 0.4):
                             found_new_cut_x = cell[0]
 
@@ -152,15 +153,11 @@ def apply_masking_v18(image, pdf_page, mask_state):
                     pass
             if found_new_cut_x or found_stopper: break
 
-        # --- MÁQUINA DE ESTADOS (STATE MACHINE) ---
-        
+        # --- ATUALIZAÇÃO DE ESTADO ---
         if found_stopper:
-            # Encontrou texto jurídico -> DESLIGA TUDO
             mask_state = {'active': False, 'mask_x': None, 'ref_cols': 0, 'last_bbox': None}
         
         elif found_new_cut_x is not None:
-            # Encontrou cabeçalho de Itens -> LIGA (Ajuste para Grupo 1 Pág 1)
-            # Só aceita se a tabela tiver estrutura de itens (>= 3 colunas)
             if max_row_cols >= 3:
                 mask_state['active'] = True
                 mask_state['mask_x'] = found_new_cut_x
@@ -168,53 +165,51 @@ def apply_masking_v18(image, pdf_page, mask_state):
                 mask_state['last_bbox'] = table.bbox
         
         elif mask_state['active']:
-            # MODO CONTINUAÇÃO (Sem cabeçalho novo)
-            # Verifica se a tabela "parece" com a anterior
             if mask_state['last_bbox']:
                 prev = mask_state['last_bbox']
                 curr = table.bbox
-                
-                # Alinhamento horizontal parecido?
                 aligned = abs(curr[0] - prev[0]) < 50
-                # Largura parecida? (Evita confundir tabela larga com caixa de assinatura pequena)
                 width_match = abs((curr[2]-curr[0]) - (prev[2]-prev[0])) < 50
                 
                 if aligned and width_match:
-                    mask_state['last_bbox'] = table.bbox # Atualiza bbox
+                    mask_state['last_bbox'] = table.bbox
                 else:
-                    # Geometria mudou -> Fim da tabela
                     mask_state = {'active': False, 'mask_x': None, 'ref_cols': 0, 'last_bbox': None}
 
-        # --- APLICAÇÃO VISUAL ---
+        # --- APLICAÇÃO VISUAL (BRANCO OU VERMELHO) ---
         if mask_state['active'] and mask_state['mask_x'] is not None:
             cut_x = mask_state['mask_x']
             t_bbox = table.bbox
             
-            # Garante que o corte está dentro dos limites horizontais da tabela
-            if t_bbox[0] < cut_x < (t_bbox[2] + 50):
-                
+            if t_bbox[0] < cut_x < (t_bbox[2] + 100):
                 x_pixel = cut_x * scale_x
                 top_pixel = t_bbox[1] * scale_y
                 bottom_pixel = t_bbox[3] * scale_y
                 right_pixel_mask = im_width 
                 
-                # 1. Retângulo Branco (Apaga colunas de preço)
+                # CONFIGURAÇÃO DE COR
+                if DEBUG_MODE:
+                    fill_color = (255, 0, 0, 150) # Vermelho semi-transparente
+                    outline_color = "red"
+                else:
+                    fill_color = "white"
+                    outline_color = None
+
+                # 1. Retângulo da Máscara
                 draw.rectangle(
                     [x_pixel, top_pixel, right_pixel_mask, bottom_pixel],
-                    fill="white", outline=None
+                    fill=fill_color, outline=outline_color
                 )
 
-                # 2. Linha Preta (Fecha a tabela)
-                draw.line(
-                    [(x_pixel, top_pixel), (x_pixel, bottom_pixel)],
-                    fill="black", width=3
-                )
+                # 2. Linha de Fechamento (Sempre preta na versão final, vermelha no debug)
+                line_color = "red" if DEBUG_MODE else "black"
+                draw.line([(x_pixel, top_pixel), (x_pixel, bottom_pixel)], fill=line_color, width=3)
                 
-                # 3. Acabamento (Traços horizontais)
-                draw.line([(x_pixel, top_pixel), (x_pixel - 5, top_pixel)], fill="black", width=2)
-                draw.line([(x_pixel, bottom_pixel), (x_pixel - 5, bottom_pixel)], fill="black", width=2)
+                if not DEBUG_MODE:
+                    draw.line([(x_pixel, top_pixel), (x_pixel - 5, top_pixel)], fill="black", width=2)
+                    draw.line([(x_pixel, bottom_pixel), (x_pixel - 5, bottom_pixel)], fill="black", width=2)
 
-    return image, mask_state
+    return image.convert("RGB"), mask_state
 
 # --- FUNÇÃO DE CONVERSÃO ---
 def convert_pdf_to_docx(file_bytes):
@@ -236,12 +231,11 @@ def convert_pdf_to_docx(file_bytes):
     section.top_margin = Cm(1.0)
     section.bottom_margin = Cm(0.5)
 
-    # ESTADO INICIAL (Limpo para cada arquivo)
     mask_state = {'active': False, 'mask_x': None, 'ref_cols': 0, 'last_bbox': None}
 
     for i, img in enumerate(images):
         if has_text_layer and pdf_plumb and i < len(pdf_plumb.pages):
-            img, mask_state = apply_masking_v18(img, pdf_plumb.pages[i], mask_state)
+            img, mask_state = apply_masking_v19(img, pdf_plumb.pages[i], mask_state)
         
         img = img.resize((595, 842)) 
         img_byte_arr = BytesIO()
@@ -273,8 +267,10 @@ uploaded_files = st.file_uploader(
 # --- PASSO 2: PROCESSAR ---
 if uploaded_files:
     st.write("---")
-    if st.button(f"🚀 Processar {len(uploaded_files)} Arquivo(s)"):
-        with st.spinner('Processando (Smart Shape Detection)...'):
+    btn_label = "🚀 Processar (Modo Diagnóstico - Vermelho)" if DEBUG_MODE else "🚀 Processar Arquivos"
+    
+    if st.button(btn_label):
+        with st.spinner('Processando...'):
             try:
                 processed_files = []
                 for uploaded_file in uploaded_files:
@@ -327,4 +323,4 @@ except:
     pass
 
 # --- RODAPÉ ---
-st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v18.0 (Shape & Context Lock)</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v19.0 (Red Mask Diagnostic)</div>', unsafe_allow_html=True)
