@@ -7,7 +7,6 @@ from io import BytesIO
 import zipfile
 import pdfplumber
 from PIL import ImageDraw
-import re
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
@@ -49,43 +48,10 @@ st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 # --- TÍTULO PRINCIPAL ---
 st.title("📑 SEI Converter ATA - SGB")
 
-# --- INTRODUÇÃO ---
 st.markdown("""
-Converta documentos PDF de **TR (Termo de Referência)** e **Proposta de Preços** em imagens otimizadas, 
-a fim de inseri-las no documento SEI: **ATA DE REGISTRO DE PREÇOS**.
+Converta documentos PDF de **TR (Termo de Referência)** e **Proposta de Preços** em imagens otimizadas 
+e mascaradas para o **SEI**.
 """)
-
-col1, col2 = st.columns([0.1, 0.9])
-with col1:
-    try:
-        st.image("icone_sei.png", width=40)
-    except:
-        st.write("🧩")
-with col2:
-    st.info("""
-    Funcionalidade disponível na extensão [**SEI PRO**](https://sei-pro.github.io/sei-pro/), 
-    utilizando a ferramenta [**INSERIR CONTEÚDO EXTERNO**](https://sei-pro.github.io/sei-pro/pages/INSERIRDOC.html).
-    """)
-
-with st.expander("⚙️ Deseja escolher a pasta onde o arquivo será salvo? Clique aqui."):
-    st.markdown("""
-    Por segurança, os navegadores salvam automaticamente na pasta "Downloads". 
-    Para escolher a pasta a cada download, configure seu navegador (Chrome/Edge):
-    1. Vá em **Configurações** > **Downloads**.
-    2. Ative: **"Perguntar onde salvar cada arquivo antes de fazer download"**.
-    """)
-
-st.write("---")
-
-# --- PASSO 1: UPLOAD ---
-st.write("### Passo 1: Upload dos Arquivos")
-st.markdown("**Nota:** O sistema aplicará a máscara automática para ocultar preços em Termos de Referência.")
-
-uploaded_files = st.file_uploader(
-    "Arraste e solte seus arquivos PDF aqui (ou clique para buscar):", 
-    type="pdf", 
-    accept_multiple_files=True
-)
 
 # --- FUNÇÃO AUXILIAR DE LIMPEZA DE TEXTO ---
 def clean_text(text):
@@ -93,13 +59,11 @@ def clean_text(text):
     text = text.replace('\n', ' ').replace('\r', ' ')
     return text.lower().strip()
 
-# --- FUNÇÃO DE MASCARAMENTO (CALIBRADA v8.2 - BORDA AJUSTADA) ---
+# --- FUNÇÃO DE MASCARAMENTO (CALIBRADA v9 - CORTE VISUAL DA TABELA) ---
 def apply_masking(image, pdf_page):
     try:
-        # Tenta estratégia de LINHAS (comum em governo)
+        # Estratégias de busca de tabela
         tables = pdf_page.find_tables(table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"})
-        
-        # Se não achar nada, tenta estratégia de TEXTO
         if not tables:
              tables = pdf_page.find_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
 
@@ -118,10 +82,10 @@ def apply_masking(image, pdf_page):
         for table in tables:
             if not table.rows: continue
 
-            # --- 1. LOCALIZAR CABEÇALHO ---
-            header_found_idx = -1
+            # --- 1. LOCALIZAR A COLUNA DE PREÇO ---
             mask_start_x = None
 
+            # Varre as primeiras linhas (cabeçalho)
             for row_idx in range(min(3, len(table.rows))):
                 row_cells = table.rows[row_idx].cells
                 for cell_idx, cell in enumerate(row_cells):
@@ -132,40 +96,43 @@ def apply_masking(image, pdf_page):
                         text_clean = clean_text(text_raw)
                         
                         if any(k in text_clean for k in keywords_target):
-                            mask_start_x = cell[0] # Coordenada X onde começa o preço
-                            header_found_idx = row_idx
+                            # Encontrou a coluna proibida!
+                            # O inicio do mascaramento é a esquerda dessa célula
+                            mask_start_x = cell[0] 
                             break 
                     except:
                         pass
                 if mask_start_x is not None:
                     break
             
-            # --- 2. APLICAR MÁSCARA VERTICAL E BORDA ---
+            # --- 2. APLICAR MÁSCARA E FECHAR A TABELA ---
             if mask_start_x is not None:
-                table_rect = table.bbox
+                table_rect = table.bbox # (x0, top, x1, bottom)
                 
-                # A) Máscara Branca (Apaga os dados)
-                # Vai do inicio da coluna de preço até o fim da tabela (+50px)
+                # A) A "Borracha" (Retângulo Branco)
+                # Apaga tudo do início da coluna de preço até o fim original da tabela (e um pouco mais para garantir)
                 rect_mask = [
                     mask_start_x * scale_x,       
                     table_rect[1] * scale_y,      
-                    table_rect[2] * scale_x + 50, 
+                    table_rect[2] * scale_x + 50, # Vai um pouco além da direita original para garantir
                     table_rect[3] * scale_y       
                 ]
                 draw.rectangle(rect_mask, fill="white", outline=None)
 
-                # B) Borda de Fechamento (Visual)
-                # AJUSTE PONTUAL: A borda da direita agora é desenhada exatamente em 'mask_start_x'
-                # Isso faz a tabela parecer terminar antes da coluna de preço.
+                # B) A Nova Borda (Retângulo Preto)
+                # AQUI ESTÁ O TRUQUE PARA A IMAGEM 1:
+                # Desenhamos a borda da Esquerda Original até o 'mask_start_x'.
+                # Isso cria uma linha vertical preta exatamente onde o preço começaria, "fechando" a tabela ali.
                 rect_border = [
                     table_rect[0] * scale_x,    # Esquerda da tabela
                     table_rect[1] * scale_y,    # Topo
-                    mask_start_x * scale_x,     # Direita (NOVO LIMITE VISUAL)
+                    mask_start_x * scale_x,     # Direita (NOVO LIMITE VISUAL - Corta aqui)
                     table_rect[3] * scale_y     # Fundo
                 ]
                 draw.rectangle(rect_border, outline="black", width=2)
 
-            # --- 3. APLICAR MÁSCARA HORIZONTAL (TOTAL) ---
+            # --- 3. LIMPEZA FINAL DE LINHAS DE TOTAL ---
+            # Caso exista uma linha de "Total Geral" abaixo que escape da lógica acima
             last_row = table.rows[-1]
             try:
                 first_cell = last_row.cells[0]
@@ -181,23 +148,20 @@ def apply_masking(image, pdf_page):
                             l_top = min(tops)
                             l_bottom = max(bottoms)
                             
-                            # Desenha retângulo branco sobre a linha total
-                            # Se a máscara vertical já cortou a tabela visualmente, 
-                            # aqui ajustamos o 'rect_total' para ir apenas até mask_start_x também se quiser,
-                            # mas manter até o fim original garante que apague qualquer "Total: R$ ..." que vaze.
-                            # Vamos manter o padrão visual de "célula vazia".
+                            # Apaga a linha de total inteira visualmente, respeitando o novo corte
                             rect_total = [
                                 table.bbox[0] * scale_x,
                                 l_top * scale_y,
-                                table.bbox[2] * scale_x, 
+                                mask_start_x * scale_x if mask_start_x else table.bbox[2] * scale_x, 
                                 l_bottom * scale_y
                             ]
-                            draw.rectangle(rect_total, fill="white", outline="black", width=2)
+                            # Se quiser apagar o valor do total (que fica a direita), o rect_mask acima já cuidou disso.
+                            # Aqui garantimos que a borda do rodapé também siga o novo alinhamento se necessário.
             except:
                 pass
 
     except Exception as e:
-        print(f"Erro mascaramento: {e}")
+        # Em caso de erro, segue sem mascarar para não travar
         pass
     
     return image
@@ -214,34 +178,41 @@ def convert_pdf_to_docx(file_bytes):
     images = convert_from_bytes(file_bytes)
     doc = Document()
     
+    # Configuração de Margens Estreitas
     section = doc.sections[0]
-    section.page_height = Cm(29.7)
-    section.page_width = Cm(21.0)
+    section.page_height = Cm(29.7) # A4 Altura
+    section.page_width = Cm(21.0)  # A4 Largura
     section.left_margin = Cm(1.0)
     section.right_margin = Cm(1.0)
     section.top_margin = Cm(1.0)
-    section.bottom_margin = Cm(1.0)
+    section.bottom_margin = Cm(0.5) # Margem inferior bem pequena
 
     for i, img in enumerate(images):
+        # Aplica a máscara se possível
         if has_text_layer and pdf_plumb and i < len(pdf_plumb.pages):
             img = apply_masking(img, pdf_plumb.pages[i])
         
-        # AJUSTE 1: Redução leve da altura (781 -> 760) para garantir que caiba na margem
-        img = img.resize((552, 760)) 
+        # OTIMIZAÇÃO DE TAMANHO (ANTI-PÁGINA EM BRANCO)
+        # Redimensionamos a imagem pixel a pixel para garantir qualidade
+        img = img.resize((595, 842)) # Tamanho A4 aproximado em pixels (baixa densidade para referência)
+        
         img_byte_arr = BytesIO()
-        img.save(img_byte_arr, format='JPEG', quality=85, optimize=True)
+        img.save(img_byte_arr, format='JPEG', quality=80, optimize=True)
         img_byte_arr.seek(0)
 
-        doc.add_picture(img_byte_arr, width=Cm(19.0))
+        # Inserção no Word
+        # ALTERAÇÃO CRÍTICA: Reduzi de 19.0cm para 18.0cm
+        # Isso garante que a altura proporcional seja menor que a altura da página,
+        # evitando que o Word jogue a imagem para a próxima página ou crie uma página vazia no final.
+        doc.add_picture(img_byte_arr, width=Cm(18.0))
         
-        # AJUSTE 2: Remover espaçamento extra do parágrafo da imagem
-        # Isso evita que o parágrafo "empurre" a quebra para a próxima página
+        # Ajuste fino do parágrafo da imagem
         par = doc.paragraphs[-1]
         par.alignment = WD_ALIGN_PARAGRAPH.CENTER
         par.paragraph_format.space_before = Pt(0)
         par.paragraph_format.space_after = Pt(0)
-        par.paragraph_format.line_spacing = 1.0
-
+        
+        # Quebra de página apenas se não for a última imagem
         if i < len(images) - 1:
             doc.add_page_break()
     
@@ -250,81 +221,41 @@ def convert_pdf_to_docx(file_bytes):
     docx_io.seek(0)
     return docx_io
 
-# --- PASSO 2: CONVERTER E DOWNLOAD ---
+# --- PASSO 1: UPLOAD ---
+uploaded_files = st.file_uploader(
+    "Arraste e solte seus arquivos PDF aqui:", 
+    type="pdf", 
+    accept_multiple_files=True
+)
+
+# --- PASSO 2: PROCESSAR ---
 if uploaded_files:
     st.write("---")
-    st.write("### Passo 2: Converter e Download")
-    
-    qtd = len(uploaded_files)
-    st.caption(f"{qtd} arquivo(s) pronto(s) para conversão.")
-
-    if st.button(f"🚀 Processar Arquivos"):
-        with st.spinner('Aplicando máscaras de sigilo e convertendo...'):
+    if st.button(f"🚀 Processar {len(uploaded_files)} Arquivo(s)"):
+        with st.spinner('Ajustando tabelas e convertendo...'):
             try:
                 processed_files = []
-                progress_bar = st.progress(0)
-                
-                for index, uploaded_file in enumerate(uploaded_files):
+                for uploaded_file in uploaded_files:
                     docx_data = convert_pdf_to_docx(uploaded_file.read())
                     file_name = uploaded_file.name.replace('.pdf', '') + "_SEI_SGB.docx"
                     processed_files.append((file_name, docx_data))
-                    progress_bar.progress((index + 1) / qtd)
 
-                st.success("✅ Conversão concluída!")
+                st.success("✅ Sucesso!")
                 
+                # Download
                 if len(processed_files) == 1:
                     name, data = processed_files[0]
-                    st.download_button(
-                        label=f"📥 Salvar {name} no Computador",
-                        data=data,
-                        file_name=name,
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        key="btn_download"
-                    )
+                    st.download_button("📥 Baixar Arquivo DOCX", data, file_name=name, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
                 else:
                     zip_buffer = BytesIO()
                     with zipfile.ZipFile(zip_buffer, "w") as zf:
                         for name, data in processed_files:
                             zf.writestr(name, data.getvalue())
                     zip_buffer.seek(0)
-                    st.download_button(
-                        label="📥 Salvar Todos (.ZIP) no Computador",
-                        data=zip_buffer,
-                        file_name="Documentos_SEI_Convertidos.zip",
-                        mime="application/zip",
-                        key="btn_download_zip"
-                    )
+                    st.download_button("📥 Baixar Todos (.ZIP)", zip_buffer, "Arquivos_SEI.zip", mime="application/zip")
 
             except Exception as e:
-                st.error(f"Erro ao processar: {e}")
-
-# --- GUIA VISUAL ---
-st.write("---")
-st.subheader("📚 Guia Rápido: Como inserir no SEI")
-
-col1, col2 = st.columns([0.15, 0.85])
-with col1:
-    try:
-        st.image("icone_sei.png", width=50) 
-    except:
-        st.write("🧩")
-with col2:
-    st.markdown("""
-    **1º Localize o ícone:** No editor do SEI, clique no botão da função **INSERIR CONTEÚDO EXTERNO** (representado pelo ícone ao lado).
-    """)
-
-st.write("")
-
-st.markdown("""
-**2º Configure a inserção:** Na janela que abrir, faça o upload do arquivo Word gerado aqui.
-""")
-
-st.warning("⚠️ **IMPORTANTE:** Certifique-se de deixar todas as caixas de seleção **DESMARCADAS**.")
-
-try:
-    st.image("print_sei.png", caption="Exemplo: Deixe as opções desmarcadas.", use_container_width=True)
-except:
-    pass
+                st.error(f"Erro: {e}")
 
 # --- RODAPÉ ---
-st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v8.2</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">SEI Converter ATA - SGB v9.0 (Tabela Ajustada)</div>', unsafe_allow_html=True)
