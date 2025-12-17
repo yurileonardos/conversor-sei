@@ -31,10 +31,15 @@ def build_docx(tr_bytes, proposal_files, debug=False):
     # -------------------------------------------------
     tr_images = _process_tr(tr_bytes, debug)
 
-    for idx, img in enumerate(tr_images):
-        _add_image_to_docx(doc, img)
-        if idx < len(tr_images) - 1:
-            doc.add_page_break()
+    if not tr_images:
+    raise RuntimeError(
+        "ERRO CRÍTICO: Nenhuma página gerada para o Termo de Referência."
+    )
+
+for idx, img in enumerate(tr_images):
+    _add_image_to_docx(doc, img)
+    doc.add_page_break()
+
 
     # -------------------------------------------------
     # 2️⃣ PROCESSAMENTO DAS PROPOSTAS (SEM MÁSCARA)
