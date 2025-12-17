@@ -44,11 +44,11 @@ def build_docx(tr_bytes, proposal_files, debug=False):
 
 
 def _process_tr(tr_bytes, debug):
-    images = pdf_to_images(tr_bytes)
+    images, pages = pdf_to_images_with_pages(tr_bytes)
     tr_images = []
 
     with pdfplumber.open(BytesIO(tr_bytes)) as pdf:
-        for page_index, page in enumerate(pdf.pages):
+        for page_index, page in enumerate(pages):
 
             img = images[page_index]
 
