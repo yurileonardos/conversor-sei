@@ -2,8 +2,10 @@ from docx import Document
 from docx.shared import Cm
 from io import BytesIO
 
+import pdfplumber
+
 from pdf_utils import pdf_to_images
-from masking_v25r import apply_masking_v25r
+from masking_table_price import apply_table_price_mask
 
 
 def build_docx(tr_bytes, proposal_files, debug=False):
@@ -16,18 +18,21 @@ def build_docx(tr_bytes, proposal_files, debug=False):
     if not tr_images:
         raise RuntimeError("Nenhuma página gerada para o Termo de Referência.")
 
-    for img in tr_images:
+    for i, img in enumerate(tr_images):
         _add_image(doc, img)
-        doc.add_page_break()
+        if i < len(tr_images) - 1:
+            doc.add_page_break()
 
     # ===== PROPOSTAS (SEM MÁSCARA) =====
     for proposal in proposal_files:
         images = pdf_to_images(proposal)
-        for img in images:
+        for i, img in enumerate(images):
             _add_image(doc, img)
-            doc.add_page_break()
+            if i < len(images) - 1:
+                doc.add_page_break()
+        doc.add_page_break()
 
-    # remove quebra extra
+    # remove quebra final extra
     if doc.paragraphs:
         p = doc.paragraphs[-1]
         p._element.getparent().remove(p._element)
@@ -38,22 +43,25 @@ def build_docx(tr_bytes, proposal_files, debug=False):
     return output
 
 
-def _process_tr(pdf_bytes, debug):
-    images, pages = pdf_to_images(pdf_bytes, return_pages=True)
-    processed = []
+def _process_tr(tr_bytes, debug):
+    images = pdf_to_images(tr_bytes)
+    tr_images = []
 
-    state = {"active": False, "cut_x": None}
+    with pdfplumber.open(BytesIO(tr_bytes)) as pdf:
+        for page_index, page in enumerate(pdf.pages):
 
-    for img, page in zip(images, pages):
-        img, state = apply_masking_v25r(
-            image=img,
-            pdf_page=page,
-            state=state,
-            debug=debug
-        )
-        processed.append(img)
+            img = images[page_index]
 
-    return processed
+            # === MÁSCARA CIRÚRGICA AQUI ===
+            img = apply_table_price_mask(
+                image=img,
+                pdf_page=page,
+                debug=debug
+            )
+
+            tr_images.append(img)
+
+    return tr_images
 
 
 def _add_image(doc, image):
