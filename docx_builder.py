@@ -4,6 +4,8 @@ from io import BytesIO
 
 from pdf_utils import pdf_to_images
 from masking_visual import apply_visual_mask
+from masking_v25r import apply_masking_v25r
+
 
 
 def build_docx(tr_bytes, proposal_files, debug=False):
@@ -23,6 +25,13 @@ def build_docx(tr_bytes, proposal_files, debug=False):
     # ==========================
     tr_images = _process_tr(tr_bytes, debug)
 
+    state = {"active": False, "cut_x": None}
+
+    for page, img in zip(pdf_pages, images):
+        img, state = apply_masking_v25r(img, page, state, debug=debug)
+        processed.append(img)
+
+    
     if not tr_images:
         raise RuntimeError("Nenhuma página gerada para o Termo de Referência.")
 
