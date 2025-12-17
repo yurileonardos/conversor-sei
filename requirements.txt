@@ -1,4 +1,5 @@
 streamlit
 pdf2image
+pillow
 python-docx
 pdfplumber
