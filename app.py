@@ -94,7 +94,7 @@ def clean_text(text):
     text = text.replace('\n', ' ').replace('\r', ' ')
     return text.lower().strip()
 
-# --- FUNÇÃO DE MASCARAMENTO (CALIBRADA v8.0) ---
+# --- FUNÇÃO DE MASCARAMENTO (CALIBRADA v8.1 - COM BORDAS) ---
 def apply_masking(image, pdf_page):
     try:
         # Tenta estratégia de LINHAS (comum em governo)
@@ -123,7 +123,6 @@ def apply_masking(image, pdf_page):
             if not table.rows: continue
 
             # --- 1. LOCALIZAR CABEÇALHO ---
-            # Vamos varrer as primeiras 3 linhas para achar o cabeçalho (as vezes tem titulo antes)
             header_found_idx = -1
             mask_start_x = None
 
@@ -154,15 +153,27 @@ def apply_masking(image, pdf_page):
             
             # --- 2. APLICAR MÁSCARA VERTICAL (COLUNAS) ---
             if mask_start_x is not None:
-                # Desenha um retângulo branco do inicio da coluna encontrada até o fim da tabela
                 table_rect = table.bbox
-                rect = [
+                
+                # Retângulo da Máscara (Branco) - Estendido (+50) para garantir que apague tudo
+                rect_mask = [
                     mask_start_x * scale_x,       # Começa na coluna de preço
                     table_rect[1] * scale_y,      # Topo da tabela
-                    table_rect[2] * scale_x + 50, # Fim da tabela (soma +50px pra garantir borda)
+                    table_rect[2] * scale_x + 50, # Estende além da borda para apagar vazamentos
                     table_rect[3] * scale_y       # Fundo da tabela
                 ]
-                draw.rectangle(rect, fill="white", outline="white")
+                # Desenha o branco para apagar os dados
+                draw.rectangle(rect_mask, fill="white", outline=None)
+
+                # AJUSTE 2: Desenha a borda de fechamento (Preta)
+                # Usa o limite original da tabela (table_rect[2]) sem o +50 para restaurar a grade
+                rect_border = [
+                    mask_start_x * scale_x,
+                    table_rect[1] * scale_y,
+                    table_rect[2] * scale_x, # Limite exato da tabela original
+                    table_rect[3] * scale_y
+                ]
+                draw.rectangle(rect_border, outline="black", width=2)
 
             # --- 3. APLICAR MÁSCARA HORIZONTAL (TOTAL) ---
             # Verifica a última linha
@@ -175,7 +186,7 @@ def apply_masking(image, pdf_page):
                     last_text = clean_text(cropped_last.extract_text())
                     
                     if "total" in last_text:
-                        # Pega bbox da linha (usando as células para calcular altura)
+                        # Pega bbox da linha
                         tops = [c[1] for c in last_row.cells if c]
                         bottoms = [c[3] for c in last_row.cells if c]
                         
@@ -189,7 +200,8 @@ def apply_masking(image, pdf_page):
                                 table.bbox[2] * scale_x, # Direita da tabela
                                 l_bottom * scale_y       # Fundo da linha
                             ]
-                            draw.rectangle(rect_total, fill="white", outline="white")
+                            # Desenha branco com borda preta para parecer uma célula vazia da tabela
+                            draw.rectangle(rect_total, fill="white", outline="black", width=2)
             except:
                 pass
 
@@ -230,11 +242,13 @@ def convert_pdf_to_docx(file_bytes):
         img.save(img_byte_arr, format='JPEG', quality=85, optimize=True)
         img_byte_arr.seek(0)
 
-        if i > 0:
-            doc.add_page_break()
-
+        # Adiciona a imagem
         doc.add_picture(img_byte_arr, width=Cm(19.0))
         doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        
+        # AJUSTE 1: Só adiciona quebra se NÃO for a última imagem
+        if i < len(images) - 1:
+            doc.add_page_break()
     
     docx_io = BytesIO()
     doc.save(docx_io)
@@ -318,4 +332,4 @@ except:
     pass
 
 # --- RODAPÉ ---
-st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v8.0</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v8.1</div>', unsafe_allow_html=True)
