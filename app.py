@@ -62,7 +62,8 @@ a fim de inseri-las no documento SEI: **ATA DE REGISTRO DE PREÇOS**.
 # --- FUNÇÃO AUXILIAR DE LIMPEZA DE TEXTO ---
 def clean_text(text):
     if not text: return ""
-    text = text.lower().strip()
+    # Garante que é string antes de manipular
+    text = str(text).lower().strip()
     for ch in ['.', ':', '-', '/']:
         text = text.replace(ch, '')
     replacements = {
@@ -73,7 +74,7 @@ def clean_text(text):
         text = text.replace(k, v)
     return text
 
-# --- FUNÇÃO DE MASCARAMENTO (v19.0 - HYBRID SCAN & RED MASK) ---
+# --- FUNÇÃO DE MASCARAMENTO (v19.1 - CORREÇÃO DE LEITURA DE TUPLA) ---
 def apply_masking_v19(image, pdf_page, mask_state):
     
     # 1. Tenta achar tabelas com LINHAS
@@ -81,26 +82,39 @@ def apply_masking_v19(image, pdf_page, mask_state):
     strategy_used = "lines"
 
     # PALAVRAS-CHAVE
-    keys_qty = ["qtde", "qtd", "quantidade", "quant", "unid", "consumo", "catmat"] # Adicionei Catmat como tentativa de pegar cabeçalho
+    keys_qty = ["qtde", "qtd", "quantidade", "quant", "unid", "consumo", "catmat"]
     keys_price = ["preco", "unitario", "estimado", "valor", "total", "maximo"]
     
-    # Verificação Rápida: Se a estratégia 'lines' não achou nada relevante, tenta 'text'
-    # Isso resolve o caso onde o Grupo 1 não tem bordas detectáveis
+    # --- CORREÇÃO DO ERRO 'TUPLE' ---
+    # Verifica se a estratégia 'lines' achou conteúdo relevante
     found_relevant_table = False
     if tables:
         for t in tables:
-            # Pega texto das primeiras linhas
-            txt = " ".join([clean_text(cell) for row in t.rows[:3] for cell in row.cells if cell])
-            if any(k in txt for k in keys_qty) or any(k in txt for k in keys_price):
+            # Extrai texto real das células (que são coordenadas/tuplas)
+            extracted_texts = []
+            for row in t.rows[:3]: # Olha as 3 primeiras linhas
+                for cell in row.cells:
+                    if cell:
+                        try:
+                            # cell é (x0, top, x1, bottom) -> Precisa cortar para ler texto
+                            cropped_cell = pdf_page.crop(cell)
+                            cell_text = cropped_cell.extract_text()
+                            if cell_text:
+                                extracted_texts.append(clean_text(cell_text))
+                        except:
+                            pass
+            
+            txt_content = " ".join(extracted_texts)
+            if any(k in txt_content for k in keys_qty) or any(k in txt_content for k in keys_price):
                 found_relevant_table = True
                 break
     
+    # Se a estratégia de LINHAS falhou em achar dados, tenta TEXTO
     if not tables or not found_relevant_table:
-        # Fallback para estratégia de TEXTO (Visual)
         tables = pdf_page.find_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
         strategy_used = "text"
 
-    draw = ImageDraw.Draw(image, "RGBA") # Modo RGBA para transparência se necessário
+    draw = ImageDraw.Draw(image, "RGBA") 
     im_width, im_height = image.size
     scale_x = im_width / pdf_page.width
     scale_y = im_height / pdf_page.height
@@ -168,41 +182,43 @@ def apply_masking_v19(image, pdf_page, mask_state):
             if mask_state['last_bbox']:
                 prev = mask_state['last_bbox']
                 curr = table.bbox
-                aligned = abs(curr[0] - prev[0]) < 50
-                width_match = abs((curr[2]-curr[0]) - (prev[2]-prev[0])) < 50
+                # Tolerância maior (50 -> 60)
+                aligned = abs(curr[0] - prev[0]) < 60
+                width_match = abs((curr[2]-curr[0]) - (prev[2]-prev[0])) < 60
                 
                 if aligned and width_match:
                     mask_state['last_bbox'] = table.bbox
                 else:
                     mask_state = {'active': False, 'mask_x': None, 'ref_cols': 0, 'last_bbox': None}
 
-        # --- APLICAÇÃO VISUAL (BRANCO OU VERMELHO) ---
+        # --- APLICAÇÃO VISUAL ---
         if mask_state['active'] and mask_state['mask_x'] is not None:
             cut_x = mask_state['mask_x']
             t_bbox = table.bbox
             
-            if t_bbox[0] < cut_x < (t_bbox[2] + 100):
+            if t_bbox[0] < cut_x < (t_bbox[2] + 150): # Aumentei tolerância para borda
                 x_pixel = cut_x * scale_x
                 top_pixel = t_bbox[1] * scale_y
                 bottom_pixel = t_bbox[3] * scale_y
                 right_pixel_mask = im_width 
                 
-                # CONFIGURAÇÃO DE COR
+                # COR
                 if DEBUG_MODE:
-                    fill_color = (255, 0, 0, 150) # Vermelho semi-transparente
+                    fill_color = (255, 0, 0, 150) # Vermelho
                     outline_color = "red"
+                    line_color = "red"
                 else:
                     fill_color = "white"
                     outline_color = None
+                    line_color = "black"
 
-                # 1. Retângulo da Máscara
+                # 1. Máscara
                 draw.rectangle(
                     [x_pixel, top_pixel, right_pixel_mask, bottom_pixel],
                     fill=fill_color, outline=outline_color
                 )
 
-                # 2. Linha de Fechamento (Sempre preta na versão final, vermelha no debug)
-                line_color = "red" if DEBUG_MODE else "black"
+                # 2. Linha
                 draw.line([(x_pixel, top_pixel), (x_pixel, bottom_pixel)], fill=line_color, width=3)
                 
                 if not DEBUG_MODE:
@@ -323,4 +339,4 @@ except:
     pass
 
 # --- RODAPÉ ---
-st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v19.0 (Red Mask Diagnostic)</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v19.1 (Bug Fix Tuple)</div>', unsafe_allow_html=True)
