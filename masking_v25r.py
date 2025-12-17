@@ -90,6 +90,29 @@ def find_x_by_header_scan(pdf_page):
                 candidates.append(w["x0"])
 
     return min(candidates) if candidates else None
+def has_price_header(pdf_page):
+    """
+    Detecta cabeçalho de colunas de preço,
+    mesmo sem valores numéricos na página.
+    """
+    words = pdf_page.extract_words()
+    hits = []
+
+    headers = [
+        "preço", "preco",
+        "unitário", "unitario",
+        "valor unitário", "valor total",
+        "(r$", "r$"
+    ]
+
+    for w in words:
+        txt = w["text"].lower()
+        if any(h in txt for h in headers):
+            if w["x0"] > pdf_page.width * 0.45:
+                hits.append(w["x0"])
+
+    # exige pelo menos 2 ocorrências alinhadas (estrutura de coluna)
+    return len(hits) >= 2
 
 
 # ==========================
@@ -128,18 +151,22 @@ def apply_masking_v25r(image, pdf_page, state, debug=False):
         state["cut_x"] = None
         return image, state
 
-    # 2️⃣ Tenta detectar preços
     cut_x = find_x_by_visual_scan(pdf_page)
 
-    if cut_x is None:
-        cut_x = find_x_by_header_scan(pdf_page)
-
-    # 3️⃣ Atualiza estado
+    # 1️⃣ valores reais → prioridade máxima
     if cut_x:
         state["active"] = True
         state["cut_x"] = cut_x
+
+    # 2️⃣ cabeçalho forte → início da tabela
+    elif has_price_header(pdf_page) and not has_legal_text(pdf_page):
+        header_x = find_x_by_header_scan(pdf_page)
+        if header_x:
+            state["active"] = True
+            state["cut_x"] = header_x
+
+    # 3️⃣ nada detectado → encerra
     else:
-        # sem preço → encerra
         state["active"] = False
         state["cut_x"] = None
         return image, state
