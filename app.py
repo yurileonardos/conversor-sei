@@ -1,7 +1,7 @@
 import streamlit as st
 from pdf2image import convert_from_bytes
 from docx import Document
-from docx.shared import Cm
+from docx.shared import Cm, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from io import BytesIO
 import zipfile
@@ -90,17 +90,16 @@ uploaded_files = st.file_uploader(
 # --- FUNÇÃO AUXILIAR DE LIMPEZA DE TEXTO ---
 def clean_text(text):
     if not text: return ""
-    # Substitui quebras de linha por espaço, remove pontuação extra e poe minusculo
     text = text.replace('\n', ' ').replace('\r', ' ')
     return text.lower().strip()
 
-# --- FUNÇÃO DE MASCARAMENTO (CALIBRADA v8.1 - COM BORDAS) ---
+# --- FUNÇÃO DE MASCARAMENTO (CALIBRADA v8.2 - BORDA AJUSTADA) ---
 def apply_masking(image, pdf_page):
     try:
         # Tenta estratégia de LINHAS (comum em governo)
         tables = pdf_page.find_tables(table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"})
         
-        # Se não achar nada, tenta estratégia de TEXTO (para tabelas sem borda)
+        # Se não achar nada, tenta estratégia de TEXTO
         if not tables:
              tables = pdf_page.find_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
 
@@ -110,15 +109,12 @@ def apply_masking(image, pdf_page):
         scale_x = im_width / pdf_page.width
         scale_y = im_height / pdf_page.height
 
-        # Palavras-chave Agressivas (com e sem acento)
         keywords_target = [
             "preco unit", "preço unit", "valor unit", "vlr. unit", "unitario", "unitário",
             "valor max", "valor estim", "preço estim", "preco estim", "valor ref", 
             "vlr total", "valor total", "preco total", "preço total"
         ]
         
-        keyword_total_row = "total"
-
         for table in tables:
             if not table.rows: continue
 
@@ -128,65 +124,56 @@ def apply_masking(image, pdf_page):
 
             for row_idx in range(min(3, len(table.rows))):
                 row_cells = table.rows[row_idx].cells
-                
-                # Verifica cada célula dessa linha
                 for cell_idx, cell in enumerate(row_cells):
                     if not cell: continue
-                    
                     try:
-                        # Extrai texto da área
                         cropped = pdf_page.crop(cell)
                         text_raw = cropped.extract_text()
                         text_clean = clean_text(text_raw)
                         
-                        # Verifica se bate com as palavras chave
                         if any(k in text_clean for k in keywords_target):
-                            # BINGO! Achamos a coluna de preço
-                            mask_start_x = cell[0] # Pega a coordenada X da esquerda
+                            mask_start_x = cell[0] # Coordenada X onde começa o preço
                             header_found_idx = row_idx
                             break 
                     except:
                         pass
-                
                 if mask_start_x is not None:
-                    break # Para de procurar cabeçalho se já achou
+                    break
             
-            # --- 2. APLICAR MÁSCARA VERTICAL (COLUNAS) ---
+            # --- 2. APLICAR MÁSCARA VERTICAL E BORDA ---
             if mask_start_x is not None:
                 table_rect = table.bbox
                 
-                # Retângulo da Máscara (Branco) - Estendido (+50) para garantir que apague tudo
+                # A) Máscara Branca (Apaga os dados)
+                # Vai do inicio da coluna de preço até o fim da tabela (+50px)
                 rect_mask = [
-                    mask_start_x * scale_x,       # Começa na coluna de preço
-                    table_rect[1] * scale_y,      # Topo da tabela
-                    table_rect[2] * scale_x + 50, # Estende além da borda para apagar vazamentos
-                    table_rect[3] * scale_y       # Fundo da tabela
+                    mask_start_x * scale_x,       
+                    table_rect[1] * scale_y,      
+                    table_rect[2] * scale_x + 50, 
+                    table_rect[3] * scale_y       
                 ]
-                # Desenha o branco para apagar os dados
                 draw.rectangle(rect_mask, fill="white", outline=None)
 
-                # AJUSTE 2: Desenha a borda de fechamento (Preta)
-                # Usa o limite original da tabela (table_rect[2]) sem o +50 para restaurar a grade
+                # B) Borda de Fechamento (Visual)
+                # AJUSTE PONTUAL: A borda da direita agora é desenhada exatamente em 'mask_start_x'
+                # Isso faz a tabela parecer terminar antes da coluna de preço.
                 rect_border = [
-                    mask_start_x * scale_x,
-                    table_rect[1] * scale_y,
-                    table_rect[2] * scale_x, # Limite exato da tabela original
-                    table_rect[3] * scale_y
+                    table_rect[0] * scale_x,    # Esquerda da tabela
+                    table_rect[1] * scale_y,    # Topo
+                    mask_start_x * scale_x,     # Direita (NOVO LIMITE VISUAL)
+                    table_rect[3] * scale_y     # Fundo
                 ]
                 draw.rectangle(rect_border, outline="black", width=2)
 
             # --- 3. APLICAR MÁSCARA HORIZONTAL (TOTAL) ---
-            # Verifica a última linha
             last_row = table.rows[-1]
             try:
-                # Pega texto da linha inteira (ou primeira celula)
                 first_cell = last_row.cells[0]
                 if first_cell:
                     cropped_last = pdf_page.crop(first_cell)
                     last_text = clean_text(cropped_last.extract_text())
                     
                     if "total" in last_text:
-                        # Pega bbox da linha
                         tops = [c[1] for c in last_row.cells if c]
                         bottoms = [c[3] for c in last_row.cells if c]
                         
@@ -194,13 +181,17 @@ def apply_masking(image, pdf_page):
                             l_top = min(tops)
                             l_bottom = max(bottoms)
                             
+                            # Desenha retângulo branco sobre a linha total
+                            # Se a máscara vertical já cortou a tabela visualmente, 
+                            # aqui ajustamos o 'rect_total' para ir apenas até mask_start_x também se quiser,
+                            # mas manter até o fim original garante que apague qualquer "Total: R$ ..." que vaze.
+                            # Vamos manter o padrão visual de "célula vazia".
                             rect_total = [
-                                table.bbox[0] * scale_x, # Esquerda da tabela
-                                l_top * scale_y,         # Topo da linha
-                                table.bbox[2] * scale_x, # Direita da tabela
-                                l_bottom * scale_y       # Fundo da linha
+                                table.bbox[0] * scale_x,
+                                l_top * scale_y,
+                                table.bbox[2] * scale_x, 
+                                l_bottom * scale_y
                             ]
-                            # Desenha branco com borda preta para parecer uma célula vazia da tabela
                             draw.rectangle(rect_total, fill="white", outline="black", width=2)
             except:
                 pass
@@ -213,7 +204,6 @@ def apply_masking(image, pdf_page):
 
 # --- FUNÇÃO DE CONVERSÃO ---
 def convert_pdf_to_docx(file_bytes):
-    # Tenta abrir com pdfplumber para ler texto
     try:
         pdf_plumb = pdfplumber.open(BytesIO(file_bytes))
         has_text_layer = True
@@ -233,20 +223,25 @@ def convert_pdf_to_docx(file_bytes):
     section.bottom_margin = Cm(1.0)
 
     for i, img in enumerate(images):
-        # Tenta mascarar se tiver camada de texto
         if has_text_layer and pdf_plumb and i < len(pdf_plumb.pages):
             img = apply_masking(img, pdf_plumb.pages[i])
         
-        img = img.resize((552, 781))
+        # AJUSTE 1: Redução leve da altura (781 -> 760) para garantir que caiba na margem
+        img = img.resize((552, 760)) 
         img_byte_arr = BytesIO()
         img.save(img_byte_arr, format='JPEG', quality=85, optimize=True)
         img_byte_arr.seek(0)
 
-        # Adiciona a imagem
         doc.add_picture(img_byte_arr, width=Cm(19.0))
-        doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
         
-        # AJUSTE 1: Só adiciona quebra se NÃO for a última imagem
+        # AJUSTE 2: Remover espaçamento extra do parágrafo da imagem
+        # Isso evita que o parágrafo "empurre" a quebra para a próxima página
+        par = doc.paragraphs[-1]
+        par.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        par.paragraph_format.space_before = Pt(0)
+        par.paragraph_format.space_after = Pt(0)
+        par.paragraph_format.line_spacing = 1.0
+
         if i < len(images) - 1:
             doc.add_page_break()
     
@@ -332,4 +327,4 @@ except:
     pass
 
 # --- RODAPÉ ---
-st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v8.1</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v8.2</div>', unsafe_allow_html=True)
