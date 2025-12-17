@@ -56,29 +56,38 @@ a fim de inseri-las no documento SEI: **ATA DE REGISTRO DE PREÇOS**.
 # --- FUNÇÃO AUXILIAR DE LIMPEZA DE TEXTO ---
 def clean_text(text):
     if not text: return ""
-    # Remove acentos básicos manualmente para garantir match
     text = text.lower().strip()
+    # Remove pontuação básica para match
+    for ch in ['.', ':', '-', '/']:
+        text = text.replace(ch, '')
+    # Remove acentos para garantir (ex: "Preço" vira "Preco")
     replacements = {
         'ç': 'c', 'ã': 'a', 'á': 'a', 'à': 'a', 'é': 'e', 'ê': 'e', 
-        'í': 'i', 'ó': 'o', 'õ': 'o', 'ú': 'u', '.': '', ':': ''
+        'í': 'i', 'ó': 'o', 'õ': 'o', 'ú': 'u'
     }
     for k, v in replacements.items():
         text = text.replace(k, v)
     return text
 
-# --- FUNÇÃO DE MASCARAMENTO (v14.0 - GEOMETRIA RÍGIDA) ---
-def apply_masking_v14(image, pdf_page, mask_state):
+# --- FUNÇÃO DE MASCARAMENTO (v15.0 - ESTRATÉGIA MISTA & TRAVA DE TEXTO) ---
+def apply_masking_v15(image, pdf_page, mask_state):
     """
-    Correções:
-    1. Só aplica em tabelas com >= 3 colunas (Evita mascarar texto solto).
-    2. Busca Qtde (Direita) OU Preço (Esquerda) para pegar o Grupo 1.
-    3. Máscara restrita à altura da tabela (bbox).
+    mask_state guarda: {'mask_x': float, 'last_bbox': list, 'strategy': str, 'cols': int}
     """
     
-    # Busca tabelas usando linhas (melhor para TRs)
-    tables = pdf_page.find_tables(table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"})
-    if not tables:
-        tables = pdf_page.find_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
+    # 1. Tenta achar tabelas com LINHAS (Alta precisão)
+    tables_lines = pdf_page.find_tables(table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"})
+    
+    # 2. Tenta achar tabelas por TEXTO (Baixa precisão, para tabelas sem borda)
+    tables_text = pdf_page.find_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
+    
+    # Decide qual usar nesta página
+    if tables_lines:
+        current_tables = tables_lines
+        current_strategy = 'lines'
+    else:
+        current_tables = tables_text
+        current_strategy = 'text'
 
     draw = ImageDraw.Draw(image)
     im_width, im_height = image.size
@@ -86,120 +95,132 @@ def apply_masking_v14(image, pdf_page, mask_state):
     scale_y = im_height / pdf_page.height
 
     # PALAVRAS-CHAVE
-    # Âncora Principal: Corta à DIREITA destas
+    # Grupo 1: Cortar à DIREITA da Quantidade
     keys_qty = ["qtde", "qtd", "quantidade", "quant", "quantitativo"]
     
-    # Âncora Secundária (Backup): Corta à ESQUERDA destas
-    keys_price = ["preco", "unitario", "estimado", "valor", "total", "maximo"]
+    # Grupo 2: Cortar à ESQUERDA do Preço (Backup se Qtde falhar ou para pegar início exato)
+    keys_price = ["preco", "unitario", "estimado", "valor", "total", "maximo", "ref", "medio"]
     
-    # Parada de Segurança
-    keys_stop = ["local", "entrega", "prazo", "assinatura", "garantia", "marca", "fabricante"]
+    # Grupo 3: Parar máscara (Stopper)
+    keys_stop = ["local", "entrega", "prazo", "assinatura", "garantia", "marca", "fabricante", "validade", "pagamento"]
 
-    for table in tables:
+    for table in current_tables:
         if not table.rows: continue
         
-        # --- TRAVA DE SEGURANÇA 1: NÚMERO DE COLUNAS ---
-        # Tabelas de itens geralmente têm: Item, Desc, Unid, Qtd, Valor... (5+ colunas).
-        # Se tiver menos de 3 colunas, provavelmente é texto ou layout, não mascaramos.
-        # Pegamos a linha com mais células para checar.
-        max_cols = max([len(r.cells) for r in table.rows])
-        if max_cols < 3:
-            # Se for uma tabela "fina" (texto), desativa a memória para não riscar a página
-            mask_state['mask_x'] = None
+        # Ignora tabelas com menos de 3 colunas (quase sempre é texto/layout)
+        num_cols = max([len(r.cells) for r in table.rows])
+        if num_cols < 3:
+            mask_state = {'mask_x': None, 'last_bbox': None, 'strategy': None, 'cols': 0}
             continue
 
-        # --- VARREDURA DE CABEÇALHO ---
+        # --- ANÁLISE DE CABEÇALHO ---
         cut_x = None
         found_stopper = False
         
-        # Aumentei para analisar as primeiras 5 linhas (para pegar tabelas com títulos mesclados)
+        # Analisa até 5 linhas para garantir
         for row_idx in range(min(5, len(table.rows))):
             row_cells = table.rows[row_idx].cells
             for cell_idx, cell in enumerate(row_cells):
                 if not cell: continue
                 try:
                     cropped = pdf_page.crop(cell)
-                    text_raw = cropped.extract_text()
-                    text = clean_text(text_raw)
+                    text = clean_text(cropped.extract_text())
                     
-                    # 1. Verifica STOPPER (Mudou o assunto?)
+                    # 1. STOPPER
                     if any(k in text for k in keys_stop):
                         found_stopper = True
                         break
 
-                    # 2. Verifica QUANTIDADE (Prioridade) -> Pega borda DIREITA (cell[2])
-                    if any(k == text or k in text.split() for k in keys_qty):
-                        cut_x = cell[2]
-                        break # Achamos o ponto exato
+                    # 2. PREÇO (Esquerda) - Prioridade alta para pegar o Grupo 1 se Qtde falhar
+                    # Se achar "Preço Unitário", corta na esquerda dele
+                    if any(k in text for k in keys_price):
+                        # Validação: Preço geralmente está na metade direita da tabela
+                        # Se estiver muito à esquerda, pode ser falso positivo
+                        if cell[0] > table.bbox[0] + (table.bbox[2] - table.bbox[0]) * 0.4:
+                            cut_x = cell[0] # Borda ESQUERDA
+                            break
 
-                    # 3. Verifica PREÇO (Backup) -> Pega borda ESQUERDA (cell[0])
-                    # Só usa se ainda não achou Qtde e se a palavra "preço" ou "unitário" estiver clara
-                    if cut_x is None and any(k in text for k in keys_price):
-                        # Validação extra: "Preço" geralmente está na coluna 4 ou 5
-                        cut_x = cell[0]
+                    # 3. QUANTIDADE (Direita)
+                    if cut_x is None and any(k == text or k in text.split() for k in keys_qty):
+                        cut_x = cell[2] # Borda DIREITA
                         
                 except:
                     pass
             if cut_x or found_stopper: break
 
-        # --- ATUALIZAÇÃO DE ESTADO ---
+        # --- ATUALIZAÇÃO DO ESTADO ---
         active_cut_x = None
 
         if found_stopper:
-            # Encontrou tabela de "Local de Entrega", etc.
-            mask_state['mask_x'] = None
-            mask_state['last_table_bbox'] = None
+            # Encontrou tabela de texto (Local, Prazo) -> Reseta tudo
+            mask_state = {'mask_x': None, 'last_bbox': None, 'strategy': None, 'cols': 0}
         
         elif cut_x is not None:
-            # Encontrou cabeçalho novo válido
+            # ACHOU CABEÇALHO NOVO!
             mask_state['mask_x'] = cut_x
-            mask_state['last_table_bbox'] = table.bbox
+            mask_state['last_bbox'] = table.bbox
+            mask_state['strategy'] = current_strategy
+            mask_state['cols'] = num_cols
             active_cut_x = cut_x
         
-        elif mask_state['mask_x'] is not None:
-            # Continuação (sem cabeçalho)
-            # Verifica alinhamento geométrico para não mascarar coisas erradas
-            if mask_state['last_table_bbox']:
-                prev = mask_state['last_table_bbox']
+        else:
+            # SEM CABEÇALHO (Possível Continuação)
+            if mask_state['mask_x'] is not None and mask_state['last_bbox']:
+                
+                # --- CHECAGEM RIGOROSA DE CONTINUIDADE ---
+                prev = mask_state['last_bbox']
                 curr = table.bbox
-                # Se a tabela tiver largura parecida (+- 5%) e alinhamento esquerdo parecido
-                if abs(curr[0] - prev[0]) < 50 and abs((curr[2]-curr[0]) - (prev[2]-prev[0])) < 50:
+                
+                # 1. Checagem de Estratégia (CRÍTICO PARA A PÁGINA 7)
+                # Se a anterior era 'lines' (tabela real) e a atual é 'text' (texto solto), NÃO É CONTINUAÇÃO.
+                if mask_state['strategy'] == 'lines' and current_strategy == 'text':
+                    active_cut_x = None
+                    # Reseta para evitar danos futuros
+                    mask_state = {'mask_x': None, 'last_bbox': None, 'strategy': None, 'cols': 0}
+                
+                # 2. Checagem de Colunas
+                # Se o número de colunas mudou drasticamente, não é a mesma tabela
+                elif abs(num_cols - mask_state['cols']) > 2:
+                    active_cut_x = None
+                    mask_state = {'mask_x': None, 'last_bbox': None, 'strategy': None, 'cols': 0}
+                
+                # 3. Checagem Geométrica (Alinhamento)
+                # Alinhamento esquerdo e largura similares
+                elif abs(curr[0] - prev[0]) < 50 and abs((curr[2]-curr[0]) - (prev[2]-prev[0])) < 50:
                     active_cut_x = mask_state['mask_x']
-                    mask_state['last_table_bbox'] = table.bbox
+                    mask_state['last_bbox'] = table.bbox # Atualiza bbox
+                    # Mantém estratégia e cols da original
                 else:
-                    # Formato mudou muito, cancela máscara
-                    mask_state['mask_x'] = None
+                    # Desalinhou -> Reseta
+                    mask_state = {'mask_x': None, 'last_bbox': None, 'strategy': None, 'cols': 0}
 
-        # --- APLICAÇÃO DA MÁSCARA (RESTRIÇÃO BBOX) ---
+        # --- APLICAÇÃO DA MÁSCARA ---
         if active_cut_x is not None:
-            t_bbox = table.bbox # (x0, top, x1, bottom)
+            t_bbox = table.bbox
             
-            # Verificação final: O corte deve estar DENTRO da largura da tabela
+            # Segurança: Corte deve estar dentro da tabela
             if t_bbox[0] < active_cut_x < t_bbox[2]:
                 
-                # Coordenadas ajustadas para escala da imagem
                 x_pixel = active_cut_x * scale_x
                 top_pixel = t_bbox[1] * scale_y
                 bottom_pixel = t_bbox[3] * scale_y
-                right_pixel = im_width # Vai até o fim da folha para garantir
+                # Vai até a direita da IMAGEM (para cobrir vazamentos) mas visualmente fecha na tabela
+                right_pixel_mask = im_width 
                 
-                # 1. Desenha o Retângulo Branco
-                # Note que usamos top_pixel e bottom_pixel da TABELA ATUAL
-                # Isso impede que a máscara invada o cabeçalho da página ou rodapé fora da tabela
+                # 1. Retângulo Branco (Apaga os dados)
                 draw.rectangle(
-                    [x_pixel, top_pixel, right_pixel, bottom_pixel],
-                    fill="white",
-                    outline=None
+                    [x_pixel, top_pixel, right_pixel_mask, bottom_pixel],
+                    fill="white", outline=None
                 )
 
-                # 2. Desenha a Linha de Fechamento (Preta)
+                # 2. Linha Preta (Fecha a tabela visualmente)
+                # Linha vertical grossa
                 draw.line(
                     [(x_pixel, top_pixel), (x_pixel, bottom_pixel)],
-                    fill="black",
-                    width=3
+                    fill="black", width=3
                 )
                 
-                # Linhas horizontais de acabamento (só um pouquinho para a esquerda)
+                # Linhas de acabamento superior/inferior (pequenos traços para a esquerda)
                 draw.line([(x_pixel, top_pixel), (x_pixel - 5, top_pixel)], fill="black", width=2)
                 draw.line([(x_pixel, bottom_pixel), (x_pixel - 5, bottom_pixel)], fill="black", width=2)
 
@@ -217,7 +238,6 @@ def convert_pdf_to_docx(file_bytes):
     images = convert_from_bytes(file_bytes)
     doc = Document()
     
-    # Margens
     section = doc.sections[0]
     section.page_height = Cm(29.7)
     section.page_width = Cm(21.0)
@@ -226,11 +246,12 @@ def convert_pdf_to_docx(file_bytes):
     section.top_margin = Cm(1.0)
     section.bottom_margin = Cm(0.5)
 
-    mask_state = {'mask_x': None, 'last_table_bbox': None}
+    # Estado Inicial
+    mask_state = {'mask_x': None, 'last_bbox': None, 'strategy': None, 'cols': 0}
 
     for i, img in enumerate(images):
         if has_text_layer and pdf_plumb and i < len(pdf_plumb.pages):
-            img, mask_state = apply_masking_v14(img, pdf_plumb.pages[i], mask_state)
+            img, mask_state = apply_masking_v15(img, pdf_plumb.pages[i], mask_state)
         
         img = img.resize((595, 842)) 
         img_byte_arr = BytesIO()
@@ -263,7 +284,7 @@ uploaded_files = st.file_uploader(
 if uploaded_files:
     st.write("---")
     if st.button(f"🚀 Processar {len(uploaded_files)} Arquivo(s)"):
-        with st.spinner('Processando tabelas com ajuste geométrico...'):
+        with st.spinner('Processando...'):
             try:
                 processed_files = []
                 for uploaded_file in uploaded_files:
@@ -316,4 +337,4 @@ except:
     pass
 
 # --- RODAPÉ ---
-st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v14.0 (Hybrid Precision)</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v15.0 (Precision Fix)</div>', unsafe_allow_html=True)
