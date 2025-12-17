@@ -17,7 +17,8 @@ st.set_page_config(
 )
 
 # --- MODO DIAGNÓSTICO ---
-DEBUG_MODE = True  # True = Vermelho | False = Branco
+# True = Vermelho | False = Branco
+DEBUG_MODE = True 
 
 # --- ESTILO CSS ---
 hide_streamlit_style = """
@@ -53,7 +54,7 @@ st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 st.title("📑 SEI Converter ATA - SGB")
 
 if DEBUG_MODE:
-    st.warning("🔴 MODO DIAGNÓSTICO: Máscaras em VERMELHO.")
+    st.warning("🔴 MODO DIAGNÓSTICO: Máscaras em VERMELHO. Verifique se UF e QTD estão visíveis.")
 
 st.markdown("""
 Converta documentos PDF de **TR (Termo de Referência)** e **Proposta de Preços** em imagens otimizadas, 
@@ -62,102 +63,173 @@ a fim de inseri-las no documento SEI: **ATA DE REGISTRO DE PREÇOS**.
 
 # --- FUNÇÕES LÓGICAS ---
 
-def find_anchor_geometry(pdf_page):
-    """
-    Procura a palavra-chave 'QTDE' ou 'QUANTIDADE' ou 'UNID' para servir de âncora.
-    Retorna: (x_right, y_top) -> Borda direita da palavra e Borda superior.
-    """
-    words = pdf_page.extract_words()
-    targets = ["qtde", "qtde.", "quantidade", "quant.", "unid", "unid.", "catmat"]
-    
-    # Filtra candidatos na metade direita da página (para evitar falsos positivos no texto)
-    candidates = []
-    for w in words:
-        txt = w['text'].lower().strip()
-        if any(t == txt or t in txt for t in targets):
-            if w['x0'] > (pdf_page.width * 0.3): # Deve estar mais para o meio/direita
-                candidates.append(w)
-    
-    if candidates:
-        # Pega o que estiver mais acima (primeiro cabeçalho que aparecer)
-        best = min(candidates, key=lambda w: w['top'])
-        return best['x1'], best['top'] # x1 é a borda direita
-        
-    return None, None
+def clean_text(text):
+    if not text: return ""
+    return str(text).strip().lower()
 
-def check_page_signature(pdf_page):
-    """Detecta se é página de assinatura (Pág 9)"""
-    text = pdf_page.extract_text().lower()
-    # Termos específicos de assinatura do SEI
-    signatures = [
-        "documento assinado eletronicamente", 
-        "assinado eletronicamente", 
-        "autenticidade deste documento", 
-        "código verificador", 
-        "oficial de brasília",
-        "chave de acesso"
+def is_price_column(text):
+    """Verifica se o conteúdo parece preço (R$ ou 0,00)"""
+    if not text: return False
+    # Regex para XX,XX
+    return bool(re.search(r'[\d\.]*,\d{2}', text))
+
+def get_table_mask_x(table, pdf_page, current_global_x):
+    """
+    Analisa UMA tabela específica e define onde começar o corte (Eixo X).
+    Retorna:
+    - cut_x (float): Posição do corte
+    - update_global (bool): Se deve atualizar a referência global
+    """
+    
+    # 1. VERIFICA STOPWORDS (Se for tabela de texto, ignora)
+    stop_words = [
+        "local", "entrega", "prazo", "assinatura", "garantia", "marca", "fabricante", 
+        "validade", "pagamento", "sanções", "sancoes", "obrigações", "fiscalização", 
+        "gestão", "cláusula", "vigência", "dotação", "objeto", "condições", "multas", 
+        "infrações", "penalidades", "rescisão", "foro", "assinado", "eletronicamente"
     ]
-    count = sum(1 for s in signatures if s in text)
-    return count >= 1
-
-# --- FUNÇÃO DE MASCARAMENTO (v28.0 - ANCHOR & SAFETY) ---
-def apply_masking_v28(image, pdf_page, mask_state):
     
+    # Extrai texto das primeiras linhas para ver se é texto jurídico
+    header_text = ""
+    for r in table.rows[:4]:
+        for c in r.cells:
+            if c:
+                try:
+                    crop = pdf_page.crop(c)
+                    header_text += clean_text(crop.extract_text()) + " "
+                except: pass
+    
+    if any(sw in header_text for sw in stop_words):
+        return None, False # Tabela proibida (Texto)
+
+    # 2. PROCURA CABEÇALHO "UF" ou "QTDE" (Âncora à Direita)
+    # Queremos cortar DEPOIS dessas colunas.
+    target_cols = ["uf", "unid", "unidade", "qtde", "qtd", "quantidade", "quant"]
+    
+    found_anchor_right_x = None
+    
+    # Varre células procurando os cabeçalhos
+    for r in table.rows[:3]: # Primeiras 3 linhas
+        for cell in r.cells:
+            if cell and isinstance(cell, (list, tuple)):
+                try:
+                    crop = pdf_page.crop(cell)
+                    txt = clean_text(crop.extract_text())
+                    # Verifica match exato ou parcial seguro
+                    if txt in target_cols or any(t == txt for t in target_cols):
+                        # Achamos! O corte deve ser na borda DIREITA (x1)
+                        if found_anchor_right_x is None or cell[2] > found_anchor_right_x:
+                            found_anchor_right_x = cell[2]
+                except: pass
+    
+    if found_anchor_right_x:
+        # Se achou UF/QTD, essa é a nova referência mestre
+        return found_anchor_right_x, True
+
+    # 3. SE NÃO TEM CABEÇALHO (Continuação)
+    # Verifica se tem números de preço. Se tiver, usa a referência global anterior.
+    # Se não tiver números e não tiver cabeçalho, provavelmente é texto.
+    has_prices = False
+    for r in table.rows[:5]:
+        for cell in r.cells:
+            if cell:
+                try:
+                    crop = pdf_page.crop(cell)
+                    if is_price_column(crop.extract_text()):
+                        has_prices = True
+                        break
+                except: pass
+        if has_prices: break
+        
+    if has_prices and current_global_x:
+        return current_global_x, False # Mantém o corte anterior
+        
+    return None, False
+
+# --- FUNÇÃO DE MASCARAMENTO (v29.0 - BOUNDING BOX & RIGHT ANCHOR) ---
+def apply_masking_v29(image, pdf_page, global_mask_percent):
+    
+    # Extrai tabelas (Linhas e Texto)
+    tables_lines = pdf_page.find_tables(table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"})
+    tables_text = pdf_page.find_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
+    # Prioriza tabelas com linhas, usa texto como fallback
+    all_tables = tables_lines + tables_text if tables_lines else tables_text
+    
+    draw = ImageDraw.Draw(image, "RGBA") 
     im_width, im_height = image.size
-    
-    # 1. SEGURANÇA: É PÁGINA DE ASSINATURA?
-    if check_page_signature(pdf_page):
-        mask_state['active'] = False
-        mask_state['cut_x_percent'] = None
-        return image.convert("RGB"), mask_state
+    scale_x = im_width / pdf_page.width
+    scale_y = im_height / pdf_page.height
 
-    # 2. BUSCA ÂNCORA (QTDE)
-    anchor_x, anchor_y = find_anchor_geometry(pdf_page)
-    
-    # Variáveis de Desenho
-    draw_start_y = 0 # Padrão: Topo da página (para continuações)
-    
-    if anchor_x:
-        # ACHOU CABEÇALHO NOVO!
-        mask_state['active'] = True
-        mask_state['cut_x_percent'] = anchor_x / pdf_page.width
-        # O corte começa na altura do cabeçalho encontrados
-        draw_start_y = (anchor_y / pdf_page.height) * im_height
-        
-    # Se não achou âncora, mas está ATIVO (Págs 2, 3, 4...), mantém.
-    # E aplica uma margem superior pequena para não cortar cabeçalho de página (se houver)
-    elif mask_state['active']:
-        draw_start_y = im_height * 0.05 # 5% de margem superior segura
+    # Filtra duplicatas de tabelas (bbox muito próximos)
+    unique_tables = []
+    for t in all_tables:
+        is_dup = False
+        for ut in unique_tables:
+            # Se bbox for muito parecido
+            if abs(t.bbox[0] - ut.bbox[0]) < 10 and abs(t.bbox[1] - ut.bbox[1]) < 10:
+                is_dup = True
+                break
+        if not is_dup:
+            unique_tables.append(t)
 
-    # 3. APLICAÇÃO
-    if mask_state['active'] and mask_state['cut_x_percent']:
-        draw = ImageDraw.Draw(image, "RGBA")
+    for table in unique_tables:
+        if not table.rows: continue
         
-        # X: Onde cortar (convertido para px)
-        cut_x_px = mask_state['cut_x_percent'] * im_width
-        safe_cut_x = cut_x_px + 5 # +5px para direita da palavra QTDE (margem)
-        
-        # Y: Altura
-        # Proteção de Rodapé: Não desenha nos últimos 5% da página
-        draw_end_y = im_height * 0.95 
-        
-        # Cores
-        if DEBUG_MODE:
-            fill = (255, 0, 0, 100)
-            line = "red"
-        else:
-            fill = "white"
-            line = "black"
+        # Ignora tabelas com menos de 3 colunas (quase sempre texto)
+        # EXCETO se já temos um global_mask_percent ativo (pode ser continuação quebrada)
+        max_cols = max([len(r.cells) for r in table.rows])
+        if max_cols < 3 and global_mask_percent is None:
+            continue
 
-        # Desenha
-        draw.rectangle(
-            [safe_cut_x, draw_start_y, im_width, draw_end_y],
-            fill=fill, outline=None
-        )
+        # Calcula onde cortar nesta tabela
+        cut_x, should_update = get_table_mask_x(table, pdf_page, global_mask_percent)
         
-        draw.line([(safe_cut_x, draw_start_y), (safe_cut_x, draw_end_y)], fill=line, width=3)
+        if should_update and cut_x:
+            # Converte para % para persistir entre páginas
+            global_mask_percent = cut_x / pdf_page.width
+        
+        # Se temos um ponto de corte válido (local ou global)
+        final_cut_x_percent = (cut_x / pdf_page.width) if cut_x else global_mask_percent
+        
+        if final_cut_x_percent:
+            
+            # --- DESENHO RESTRITO AO BBOX DA TABELA ---
+            
+            # X: Começa na referência (UF/QTD) + Margem
+            x_pixel = (final_cut_x_percent * im_width) + 10 # +10px de folga para não cortar a letra da Qtd
+            
+            # Y: Usa EXATAMENTE o topo e fundo da tabela detectada
+            t_bbox = table.bbox
+            top_pixel = t_bbox[1] * scale_y
+            bottom_pixel = t_bbox[3] * scale_y
+            
+            # Validação: Só desenha se o corte estiver "dentro" da largura da página
+            if x_pixel < im_width:
+                
+                # Cores
+                if DEBUG_MODE:
+                    fill = (255, 0, 0, 100)
+                    line = "red"
+                else:
+                    fill = "white"
+                    line = "black"
 
-    return image.convert("RGB"), mask_state
+                # Retângulo (Da âncora até a borda direita da tabela ou da página)
+                # Usamos im_width na direita para garantir que cubra até o fim, 
+                # mas limitado verticalmente pela tabela.
+                draw.rectangle(
+                    [x_pixel, top_pixel, im_width, bottom_pixel],
+                    fill=fill, outline=None
+                )
+                
+                draw.line([(x_pixel, top_pixel), (x_pixel, bottom_pixel)], fill=line, width=3)
+                
+                if not DEBUG_MODE:
+                    # Acabamento
+                    draw.line([(x_pixel, top_pixel), (x_pixel - 5, top_pixel)], fill="black", width=2)
+                    draw.line([(x_pixel, bottom_pixel), (x_pixel - 5, bottom_pixel)], fill="black", width=2)
+
+    return image.convert("RGB"), global_mask_percent
 
 # --- FUNÇÃO DE CONVERSÃO ---
 def convert_pdf_to_docx(file_bytes):
@@ -171,6 +243,7 @@ def convert_pdf_to_docx(file_bytes):
     images = convert_from_bytes(file_bytes)
     doc = Document()
     
+    # Configuração A4
     section = doc.sections[0]
     section.page_height = Cm(29.7)
     section.page_width = Cm(21.0)
@@ -179,11 +252,11 @@ def convert_pdf_to_docx(file_bytes):
     section.top_margin = Cm(1.0)
     section.bottom_margin = Cm(0.5)
 
-    mask_state = {'active': False, 'cut_x_percent': None}
+    global_mask_percent = None # Estado persistente do corte X
 
     for i, img in enumerate(images):
         if has_text_layer and pdf_plumb and i < len(pdf_plumb.pages):
-            img, mask_state = apply_masking_v28(img, pdf_plumb.pages[i], mask_state)
+            img, global_mask_percent = apply_masking_v29(img, pdf_plumb.pages[i], global_mask_percent)
         
         img = img.resize((595, 842)) 
         img_byte_arr = BytesIO()
@@ -213,7 +286,7 @@ if uploaded_files:
     btn_label = "🚀 Processar (Vermelho)" if DEBUG_MODE else "🚀 Processar Arquivos"
     
     if st.button(btn_label):
-        with st.spinner('Processando...'):
+        with st.spinner('Processando com proteção de UF/QTD...'):
             try:
                 processed_files = []
                 for uploaded_file in uploaded_files:
@@ -256,4 +329,4 @@ try:
 except:
     pass
 
-st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v28.0 (Anchor & Safety)</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v29.0 (Box & Right Anchor)</div>', unsafe_allow_html=True)
