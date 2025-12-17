@@ -1,144 +1,154 @@
 def apply_table_price_mask(image, pdf_page, debug=False):
     """
-    Aplica máscara APENAS nas colunas de preço,
-    APENAS dentro da área real da tabela.
+    Máscara cirúrgica baseada em BLOCO REAL DE TABELA.
 
-    - Não mascara página inteira
-    - Não mascara texto fora de tabela
-    - Funciona nas páginas 1 e 2 (pouca repetição)
-    - Para automaticamente quando não há tabela
+    - Detecta tabelas mesmo com colunas mescladas
+    - Não mascara texto corrido
+    - Não herda estado entre páginas
+    - Só aplica máscara se houver estrutura tabular + indício de preço
     """
 
     import re
     from PIL import ImageDraw
 
-    # ---------------------------
-    # 0. Sanidade básica
-    # ---------------------------
-    if image is None or pdf_page is None:
-        return image
-
-    img_width, img_height = image.size
-    draw = ImageDraw.Draw(image, "RGBA")
-
+    # -------------------------------------------------
+    # 0. Extração de palavras
+    # -------------------------------------------------
     words = pdf_page.extract_words(use_text_flow=True)
     if not words:
-        return image  # Página sem texto → nada a fazer
+        return image
 
-    # ---------------------------
-    # 1. Detectar linhas "tabulares"
-    # ---------------------------
+    img_w, img_h = image.size
+    draw = ImageDraw.Draw(image, "RGBA")
+
+    # -------------------------------------------------
+    # 1. Agrupar palavras em linhas visuais
+    # -------------------------------------------------
     lines = {}
-
     for w in words:
-        # Agrupa por proximidade vertical (linhas visuais)
+        # Agrupamento vertical com tolerância
         y_key = round(w["top"] / 4) * 4
         lines.setdefault(y_key, []).append(w)
 
-    table_lines = []
+    # -------------------------------------------------
+    # 2. Identificar linhas TABULARES reais
+    #    (colunas justapostas, não texto corrido)
+    # -------------------------------------------------
+    tabular_lines = []
 
-    for y, ws in lines.items():
-        xs = [w["x0"] for w in ws]
+    for y, ws in sorted(lines.items()):
+        xs = sorted(w["x0"] for w in ws)
 
-        # Critério de tabela:
-        # - múltiplas colunas
-        # - espalhadas horizontalmente
-        if len(xs) >= 3 and (max(xs) - min(xs)) > pdf_page.width * 0.35:
-            table_lines.append((y, ws))
+        # Poucas palavras não caracterizam tabela
+        if len(xs) < 3:
+            continue
 
-    # Se não há indício de tabela → NÃO mascara
-    if not table_lines:
+        # Espaços entre "colunas"
+        gaps = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
+        large_gaps = [g for g in gaps if g > pdf_page.width * 0.05]
+
+        # Regra-chave: pelo menos 2 separações claras → colunas
+        if len(large_gaps) >= 2:
+            tabular_lines.append((y, ws))
+
+    # -------------------------------------------------
+    # 3. Exigir continuidade vertical (bloco de tabela)
+    # -------------------------------------------------
+    blocks = []
+    current_block = []
+
+    for (y, ws) in tabular_lines:
+        if not current_block:
+            current_block = [(y, ws)]
+        else:
+            prev_y = current_block[-1][0]
+            # Linhas próximas verticalmente
+            if abs(y - prev_y) <= 10:
+                current_block.append((y, ws))
+            else:
+                if len(current_block) >= 2:
+                    blocks.append(current_block)
+                current_block = [(y, ws)]
+
+    if len(current_block) >= 2:
+        blocks.append(current_block)
+
+    # Sem bloco tabular real → NÃO mascara
+    if not blocks:
         return image
 
-    # ---------------------------
-    # 2. Limites verticais reais da tabela
-    # ---------------------------
-    table_top_pdf = min(y for y, _ in table_lines)
+    # Usa o maior bloco (tabela principal da página)
+    table_block = max(blocks, key=len)
+
+    # -------------------------------------------------
+    # 4. Limites verticais REAIS da tabela
+    # -------------------------------------------------
+    table_top_pdf = min(y for y, _ in table_block)
     table_bottom_pdf = max(
-        max(w["bottom"] for w in ws) for _, ws in table_lines
+        max(w["bottom"] for w in ws) for _, ws in table_block
     )
 
-    # ---------------------------
-    # 3. Detectar coluna de preços
-    # ---------------------------
-    price_pattern = re.compile(r"\d[\d\.]*,\d{2}")
+    # -------------------------------------------------
+    # 5. Detectar coluna de preço
+    # -------------------------------------------------
+    price_regex = re.compile(r"\d[\d\.]*,\d{2}")
     price_x_candidates = []
 
-    # 3.1 Detecção por valores monetários
-    for _, ws in table_lines:
+    # 5.1 Por valores monetários
+    for _, ws in table_block:
         for w in ws:
-            if price_pattern.search(w["text"]):
+            if price_regex.search(w["text"]):
                 price_x_candidates.append(w["x0"])
 
-    # 3.2 Fallback por cabeçalho (páginas 1 e 2)
+    # 5.2 Fallback por cabeçalho (páginas 1 e 2)
     if not price_x_candidates:
-        for _, ws in table_lines:
+        for _, ws in table_block:
             for w in ws:
                 t = w["text"].lower()
-                if any(k in t for k in [
-                    "preço", "preco", "unitário", "unitario",
-                    "total", "(r$)", "r$"
-                ]):
+                if any(k in t for k in ["preço", "preco", "unitário", "unitario", "total", "r$"]):
                     price_x_candidates.append(w["x0"])
 
-    # Se tabela não contém preço → NÃO mascara
     if not price_x_candidates:
         return image
 
-    # Coluna de preço mais à esquerda
     cut_x_pdf = min(price_x_candidates)
 
-    # ---------------------------
-    # 4. Converter coordenadas PDF → Imagem
-    # ---------------------------
-    cut_x_img = (cut_x_pdf / pdf_page.width) * img_width - 5
-
-    table_top_img = (table_top_pdf / pdf_page.height) * img_height
-    table_bottom_img = (table_bottom_pdf / pdf_page.height) * img_height
+    # -------------------------------------------------
+    # 6. Converter coordenadas PDF → imagem
+    # -------------------------------------------------
+    cut_x_img = (cut_x_pdf / pdf_page.width) * img_w - 5
+    y_top_img = (table_top_pdf / pdf_page.height) * img_h
+    y_bot_img = (table_bottom_pdf / pdf_page.height) * img_h
 
     # Proteções finais
-    cut_x_img = max(0, min(cut_x_img, img_width))
-    table_top_img = max(0, min(table_top_img, img_height))
-    table_bottom_img = max(0, min(table_bottom_img, img_height))
+    cut_x_img = max(0, min(cut_x_img, img_w))
+    y_top_img = max(0, min(y_top_img, img_h))
+    y_bot_img = max(0, min(y_bot_img, img_h))
 
-    # ---------------------------
-    # 5. Aplicar máscara (somente na tabela)
-    # ---------------------------
+    # -------------------------------------------------
+    # 7. Aplicar máscara SOMENTE na área da tabela
+    # -------------------------------------------------
     fill_color = (255, 0, 0, 120) if debug else "white"
 
     draw.rectangle(
-        [
-            cut_x_img,
-            table_top_img,
-            img_width,
-            table_bottom_img
-        ],
+        [cut_x_img, y_top_img, img_w, y_bot_img],
         fill=fill_color,
         outline=None
     )
 
-    # ---------------------------
-    # 6. Modo diagnóstico (opcional)
-    # ---------------------------
+    # -------------------------------------------------
+    # 8. Modo diagnóstico (opcional)
+    # -------------------------------------------------
     if debug:
-        # contorno da tabela
+        # Contorno da tabela
         draw.rectangle(
-            [
-                0,
-                table_top_img,
-                img_width,
-                table_bottom_img
-            ],
+            [0, y_top_img, img_w, y_bot_img],
             outline="blue",
             width=2
         )
-
-        # linha de corte
+        # Linha de corte
         draw.line(
-            [
-                (cut_x_img, table_top_img),
-                (cut_x_img, table_bottom_img)
-            ],
+            [(cut_x_img, y_top_img), (cut_x_img, y_bot_img)],
             fill="red",
             width=2
         )
