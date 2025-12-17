@@ -1,0 +1,12 @@
+from docx.shared import Cm
+
+TARGET_WIDTH  = 552
+TARGET_HEIGHT = 781
+
+PAGE_WIDTH  = Cm(21.0)
+PAGE_HEIGHT = Cm(29.7)
+
+MARGIN_LEFT   = Cm(1.0)
+MARGIN_RIGHT  = Cm(1.0)
+MARGIN_TOP    = Cm(1.0)
+MARGIN_BOTTOM = Cm(0.5)
