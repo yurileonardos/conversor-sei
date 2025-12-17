@@ -3,7 +3,6 @@ from docx.shared import Cm
 from io import BytesIO
 
 from pdf_utils import pdf_to_images
-from masking_visual import apply_visual_mask
 from masking_v25r import apply_masking_v25r
 
 
@@ -69,9 +68,17 @@ def _process_tr(pdf_bytes, debug):
     images = pdf_to_images(pdf_bytes)
     processed = []
 
-    for img in images:
-        img = apply_visual_mask(img, debug=debug)
-        processed.append(img)
+   state = {"active": False, "cut_x": None}
+
+for pdf_page, img in zip(pdf_pages, images):
+    img, state = apply_masking_v25r(
+        image=img,
+        pdf_page=pdf_page,
+        state=state,
+        debug=debug
+    )
+    processed.append(img)
+
 
     return processed
 
