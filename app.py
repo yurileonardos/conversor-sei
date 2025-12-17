@@ -48,10 +48,43 @@ st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 # --- TÍTULO PRINCIPAL ---
 st.title("📑 SEI Converter ATA - SGB")
 
+# --- INTRODUÇÃO ---
 st.markdown("""
-Converta documentos PDF de **TR (Termo de Referência)** e **Proposta de Preços** em imagens otimizadas 
-e mascaradas para o **SEI**.
+Converta documentos PDF de **TR (Termo de Referência)** e **Proposta de Preços** em imagens otimizadas, 
+a fim de inseri-las no documento SEI: **ATA DE REGISTRO DE PREÇOS**.
 """)
+
+col1, col2 = st.columns([0.1, 0.9])
+with col1:
+    try:
+        st.image("icone_sei.png", width=40)
+    except:
+        st.write("🧩")
+with col2:
+    st.info("""
+    Funcionalidade disponível na extensão [**SEI PRO**](https://sei-pro.github.io/sei-pro/), 
+    utilizando a ferramenta [**INSERIR CONTEÚDO EXTERNO**](https://sei-pro.github.io/sei-pro/pages/INSERIRDOC.html).
+    """)
+
+with st.expander("⚙️ Deseja escolher a pasta onde o arquivo será salvo? Clique aqui."):
+    st.markdown("""
+    Por segurança, os navegadores salvam automaticamente na pasta "Downloads". 
+    Para escolher a pasta a cada download, configure seu navegador (Chrome/Edge):
+    1. Vá em **Configurações** > **Downloads**.
+    2. Ative: **"Perguntar onde salvar cada arquivo antes de fazer download"**.
+    """)
+
+st.write("---")
+
+# --- PASSO 1: UPLOAD ---
+st.write("### Passo 1: Upload dos Arquivos")
+st.markdown("**Nota:** O sistema aplicará a máscara automática para ocultar preços em Termos de Referência.")
+
+uploaded_files = st.file_uploader(
+    "Arraste e solte seus arquivos PDF aqui (ou clique para buscar):", 
+    type="pdf", 
+    accept_multiple_files=True
+)
 
 # --- FUNÇÃO AUXILIAR DE LIMPEZA DE TEXTO ---
 def clean_text(text):
@@ -97,7 +130,6 @@ def apply_masking(image, pdf_page):
                         
                         if any(k in text_clean for k in keywords_target):
                             # Encontrou a coluna proibida!
-                            # O inicio do mascaramento é a esquerda dessa célula
                             mask_start_x = cell[0] 
                             break 
                     except:
@@ -110,29 +142,24 @@ def apply_masking(image, pdf_page):
                 table_rect = table.bbox # (x0, top, x1, bottom)
                 
                 # A) A "Borracha" (Retângulo Branco)
-                # Apaga tudo do início da coluna de preço até o fim original da tabela (e um pouco mais para garantir)
                 rect_mask = [
                     mask_start_x * scale_x,       
                     table_rect[1] * scale_y,      
-                    table_rect[2] * scale_x + 50, # Vai um pouco além da direita original para garantir
+                    table_rect[2] * scale_x + 50, # Vai um pouco além da direita original
                     table_rect[3] * scale_y       
                 ]
                 draw.rectangle(rect_mask, fill="white", outline=None)
 
-                # B) A Nova Borda (Retângulo Preto)
-                # AQUI ESTÁ O TRUQUE PARA A IMAGEM 1:
-                # Desenhamos a borda da Esquerda Original até o 'mask_start_x'.
-                # Isso cria uma linha vertical preta exatamente onde o preço começaria, "fechando" a tabela ali.
+                # B) A Nova Borda (Retângulo Preto) - Corta visualmente a tabela
                 rect_border = [
                     table_rect[0] * scale_x,    # Esquerda da tabela
                     table_rect[1] * scale_y,    # Topo
-                    mask_start_x * scale_x,     # Direita (NOVO LIMITE VISUAL - Corta aqui)
+                    mask_start_x * scale_x,     # Direita (NOVO LIMITE VISUAL)
                     table_rect[3] * scale_y     # Fundo
                 ]
                 draw.rectangle(rect_border, outline="black", width=2)
 
             # --- 3. LIMPEZA FINAL DE LINHAS DE TOTAL ---
-            # Caso exista uma linha de "Total Geral" abaixo que escape da lógica acima
             last_row = table.rows[-1]
             try:
                 first_cell = last_row.cells[0]
@@ -155,13 +182,11 @@ def apply_masking(image, pdf_page):
                                 mask_start_x * scale_x if mask_start_x else table.bbox[2] * scale_x, 
                                 l_bottom * scale_y
                             ]
-                            # Se quiser apagar o valor do total (que fica a direita), o rect_mask acima já cuidou disso.
-                            # Aqui garantimos que a borda do rodapé também siga o novo alinhamento se necessário.
+                            draw.rectangle(rect_total, fill="white", outline="black", width=2)
             except:
                 pass
 
     except Exception as e:
-        # Em caso de erro, segue sem mascarar para não travar
         pass
     
     return image
@@ -180,33 +205,27 @@ def convert_pdf_to_docx(file_bytes):
     
     # Configuração de Margens Estreitas
     section = doc.sections[0]
-    section.page_height = Cm(29.7) # A4 Altura
-    section.page_width = Cm(21.0)  # A4 Largura
+    section.page_height = Cm(29.7)
+    section.page_width = Cm(21.0)
     section.left_margin = Cm(1.0)
     section.right_margin = Cm(1.0)
     section.top_margin = Cm(1.0)
-    section.bottom_margin = Cm(0.5) # Margem inferior bem pequena
+    section.bottom_margin = Cm(0.5)
 
     for i, img in enumerate(images):
-        # Aplica a máscara se possível
         if has_text_layer and pdf_plumb and i < len(pdf_plumb.pages):
             img = apply_masking(img, pdf_plumb.pages[i])
         
         # OTIMIZAÇÃO DE TAMANHO (ANTI-PÁGINA EM BRANCO)
-        # Redimensionamos a imagem pixel a pixel para garantir qualidade
-        img = img.resize((595, 842)) # Tamanho A4 aproximado em pixels (baixa densidade para referência)
+        img = img.resize((595, 842)) 
         
         img_byte_arr = BytesIO()
         img.save(img_byte_arr, format='JPEG', quality=80, optimize=True)
         img_byte_arr.seek(0)
 
-        # Inserção no Word
-        # ALTERAÇÃO CRÍTICA: Reduzi de 19.0cm para 18.0cm
-        # Isso garante que a altura proporcional seja menor que a altura da página,
-        # evitando que o Word jogue a imagem para a próxima página ou crie uma página vazia no final.
+        # Inserção no Word com largura reduzida (18cm)
         doc.add_picture(img_byte_arr, width=Cm(18.0))
         
-        # Ajuste fino do parágrafo da imagem
         par = doc.paragraphs[-1]
         par.alignment = WD_ALIGN_PARAGRAPH.CENTER
         par.paragraph_format.space_before = Pt(0)
@@ -221,41 +240,51 @@ def convert_pdf_to_docx(file_bytes):
     docx_io.seek(0)
     return docx_io
 
-# --- PASSO 1: UPLOAD ---
-uploaded_files = st.file_uploader(
-    "Arraste e solte seus arquivos PDF aqui:", 
-    type="pdf", 
-    accept_multiple_files=True
-)
-
 # --- PASSO 2: PROCESSAR ---
 if uploaded_files:
     st.write("---")
-    if st.button(f"🚀 Processar {len(uploaded_files)} Arquivo(s)"):
+    st.write("### Passo 2: Converter e Download")
+    
+    qtd = len(uploaded_files)
+    st.caption(f"{qtd} arquivo(s) pronto(s) para conversão.")
+
+    if st.button(f"🚀 Processar Arquivos"):
         with st.spinner('Ajustando tabelas e convertendo...'):
             try:
                 processed_files = []
-                for uploaded_file in uploaded_files:
+                progress_bar = st.progress(0)
+                
+                for index, uploaded_file in enumerate(uploaded_files):
                     docx_data = convert_pdf_to_docx(uploaded_file.read())
                     file_name = uploaded_file.name.replace('.pdf', '') + "_SEI_SGB.docx"
                     processed_files.append((file_name, docx_data))
+                    progress_bar.progress((index + 1) / qtd)
 
-                st.success("✅ Sucesso!")
+                st.success("✅ Conversão concluída!")
                 
-                # Download
                 if len(processed_files) == 1:
                     name, data = processed_files[0]
-                    st.download_button("📥 Baixar Arquivo DOCX", data, file_name=name, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                    st.download_button(
+                        label=f"📥 Salvar {name} no Computador",
+                        data=data,
+                        file_name=name,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    )
                 else:
                     zip_buffer = BytesIO()
                     with zipfile.ZipFile(zip_buffer, "w") as zf:
                         for name, data in processed_files:
                             zf.writestr(name, data.getvalue())
                     zip_buffer.seek(0)
-                    st.download_button("📥 Baixar Todos (.ZIP)", zip_buffer, "Arquivos_SEI.zip", mime="application/zip")
+                    st.download_button(
+                        label="📥 Salvar Todos (.ZIP) no Computador",
+                        data=zip_buffer,
+                        file_name="Documentos_SEI_Convertidos.zip",
+                        mime="application/zip"
+                    )
 
             except Exception as e:
                 st.error(f"Erro: {e}")
 
 # --- RODAPÉ ---
-st.markdown('<div class="footer">SEI Converter ATA - SGB v9.0 (Tabela Ajustada)</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v9.0</div>', unsafe_allow_html=True)
