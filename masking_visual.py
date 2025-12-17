@@ -13,8 +13,29 @@ def detect_last_two_columns(table_bbox):
     pass
 
 
-def apply_visual_mask(image, table_bbox, cut_x):
+from PIL import ImageDraw
+
+def apply_visual_mask(image, debug=False):
     """
-    Aplica máscara sem sobrepor texto externo
+    Aplica mascaramento visual nas duas últimas colunas da tabela.
+    O parâmetro debug controla a visualização da máscara.
     """
-    pass
+    draw = ImageDraw.Draw(image, "RGBA")
+
+    # ⚠️ IMPLEMENTAÇÃO ATUAL SIMPLIFICADA
+    # (exemplo de placeholder visual)
+    width, height = image.size
+    cut_x = int(width * 0.70)
+
+    if debug:
+        fill = (255, 0, 0, 120)  # vermelho translúcido
+    else:
+        fill = (255, 255, 255, 255)  # branco (produção)
+
+    draw.rectangle(
+        [cut_x, 0, width, height],
+        fill=fill
+    )
+
+    return image
+
