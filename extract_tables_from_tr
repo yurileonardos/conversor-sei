@@ -1,0 +1,12 @@
+from tr_to_html import extract_tables_from_tr
+from sei_templates import render_table_sei
+
+
+def tr_pdf_to_sei_html(pdf_bytes):
+    tables = extract_tables_from_tr(pdf_bytes)
+
+    html_blocks = []
+    for table in tables:
+        html_blocks.append(render_table_sei(table))
+
+    return "\n".join(html_blocks)
