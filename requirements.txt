@@ -1,6 +1,5 @@
 streamlit
-pillow
-python-docx
+pdf2image
 pdfplumber
-pymupdf
-
+python-docx
+Pillow
