@@ -57,7 +57,7 @@ a fim de inseri-las no documento SEI: **ATA DE REGISTRO DE PREÇOS**.
 def clean_text(text):
     if not text: return ""
     text = text.lower().strip()
-    # Remove pontuação básica para facilitar a busca
+    # Remove pontuação básica para facilitar a busca, mas mantém estrutura
     for ch in ['.', ':', '-', '/']:
         text = text.replace(ch, '')
     # Remove acentos
@@ -69,17 +69,17 @@ def clean_text(text):
         text = text.replace(k, v)
     return text
 
-# --- FUNÇÃO DE MASCARAMENTO (v16.0 - PERSISTÊNCIA ENTRE PÁGINAS) ---
-def apply_masking_v16(image, pdf_page, mask_state):
+# --- FUNÇÃO DE MASCARAMENTO (v17.0 - TRAVA DE COLUNAS & DEEP SCAN) ---
+def apply_masking_v17(image, pdf_page, mask_state):
     """
-    mask_state: Dicionário que persiste entre as páginas.
-    Keys: 
-      - 'active': bool (se a máscara está ligada)
-      - 'mask_x': float (a coordenada X onde começa o corte)
-      - 'last_bbox': list (a geometria da última tabela processada)
+    mask_state keys:
+      'active': bool
+      'mask_x': float
+      'ref_cols': int (Número de colunas da tabela original)
+      'last_bbox': list
     """
     
-    # Tenta achar tabelas (prioriza linhas, fallback para texto)
+    # Busca tabelas
     tables = pdf_page.find_tables(table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"})
     if not tables:
         tables = pdf_page.find_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
@@ -87,32 +87,38 @@ def apply_masking_v16(image, pdf_page, mask_state):
     draw = ImageDraw.Draw(image)
     im_width, im_height = image.size
     
-    # Fatores de escala (PDF -> Imagem)
     scale_x = im_width / pdf_page.width
     scale_y = im_height / pdf_page.height
 
     # PALAVRAS-CHAVE
-    # Ativação (Cabeçalho de Tabela de Preço/Item)
     keys_qty = ["qtde", "qtd", "quantidade", "quant", "unid"]
     keys_price = ["preco", "unitario", "estimado", "valor", "total", "maximo"]
     
-    # Desativação (Fim da lista de itens)
-    keys_stop = ["local", "entrega", "prazo", "assinatura", "garantia", "marca", "fabricante", "validade", "pagamento", "sançoes", "sancoes"]
+    # STOPPERS (Texto que indica fim definitivo)
+    keys_stop = ["local", "entrega", "prazo", "assinatura", "garantia", "marca", "fabricante", 
+                 "validade", "pagamento", "sançoes", "sancoes", "obrigacoes", "fiscalizacao", "gestao"]
 
     for table in tables:
         if not table.rows: continue
         
-        # Ignora tabelas muito pequenas (menos de 3 colunas) a menos que já estejamos mascarando
-        num_cols = max([len(r.cells) for r in table.rows])
-        if num_cols < 3 and not mask_state['active']:
+        # --- CONTAGEM DE COLUNAS (CRÍTICO) ---
+        # Conta quantas células tem na linha mais cheia da tabela
+        curr_cols = max([len(r.cells) for r in table.rows])
+        
+        # Se for uma tabela muito estreita (ex: texto solto com 1 coluna), 
+        # e a referência anterior era larga (ex: 5+ colunas), isso é um STOP imediato.
+        if mask_state['active'] and mask_state['ref_cols'] >= 3 and curr_cols < 3:
+            mask_state = {'active': False, 'mask_x': None, 'ref_cols': 0, 'last_bbox': None}
             continue
 
-        # --- FASE 1: ANÁLISE DE CONTEXTO (Cabeçalho ou Stopper) ---
+        # --- ANÁLISE DE CONTEXTO ---
         found_new_cut_x = None
         found_stopper = False
         
-        # Analisa as primeiras 5 linhas da tabela
-        for row_idx in range(min(5, len(table.rows))):
+        # DEEP SCAN: Varre até 8 linhas para achar o cabeçalho "Item/Qtde" escondido
+        scan_limit = min(8, len(table.rows))
+        
+        for row_idx in range(scan_limit):
             row_cells = table.rows[row_idx].cells
             for cell_idx, cell in enumerate(row_cells):
                 if not cell: continue
@@ -120,85 +126,86 @@ def apply_masking_v16(image, pdf_page, mask_state):
                     cropped = pdf_page.crop(cell)
                     text = clean_text(cropped.extract_text())
                     
-                    # A) Verificar STOPPER (Texto que indica fim da tabela de itens)
+                    # 1. STOPPER
                     if any(k in text for k in keys_stop):
                         found_stopper = True
                         break
 
-                    # B) Verificar Início de Tabela (Cabeçalho)
-                    # Prioridade 1: Achar a coluna QUANTIDADE (Corta à DIREITA)
+                    # 2. START (Quantidade) -> Pega borda DIREITA
                     if any(k == text or k in text.split() for k in keys_qty):
-                        found_new_cut_x = cell[2] # Borda DIREITA
+                        found_new_cut_x = cell[2]
                     
-                    # Prioridade 2: Achar a coluna PREÇO (Corta à ESQUERDA) - Backup
+                    # 3. START ALTERNATIVO (Preço) -> Pega borda ESQUERDA (Backup)
                     elif found_new_cut_x is None and any(k in text for k in keys_price):
-                         # Validação: Preço geralmente está na metade direita da página
+                         # Só aceita se estiver na metade direita da página (evita falsos positivos)
                          if cell[0] > (pdf_page.width * 0.4):
-                            found_new_cut_x = cell[0] # Borda ESQUERDA
+                            found_new_cut_x = cell[0]
 
                 except:
                     pass
             if found_new_cut_x or found_stopper: break
 
-        # --- FASE 2: ATUALIZAÇÃO DO ESTADO (Memória) ---
+        # --- ATUALIZAÇÃO DE ESTADO ---
         
         if found_stopper:
-            # Encontrou "Local de Entrega" ou similar -> DESLIGA MÁSCARA
-            mask_state['active'] = False
-            mask_state['mask_x'] = None
-            mask_state['last_bbox'] = None
+            # Texto de encerramento detectado
+            mask_state = {'active': False, 'mask_x': None, 'ref_cols': 0, 'last_bbox': None}
         
         elif found_new_cut_x is not None:
-            # Encontrou NOVO cabeçalho de itens -> LIGA/ATUALIZA MÁSCARA
-            mask_state['active'] = True
-            mask_state['mask_x'] = found_new_cut_x
-            mask_state['last_bbox'] = table.bbox
+            # NOVO cabeçalho detectado (Início de Grupo)
+            if curr_cols >= 3: # Só ativa se parecer uma tabela de itens
+                mask_state['active'] = True
+                mask_state['mask_x'] = found_new_cut_x
+                mask_state['ref_cols'] = curr_cols # Grava o nº de colunas padrão
+                mask_state['last_bbox'] = table.bbox
         
         elif mask_state['active']:
-            # NÃO achou cabeçalho, mas a máscara está LIGADA (Continuação)
-            # Verifica se a tabela atual parece continuação da anterior (Alinhamento Horizontal)
+            # MODO CONTINUAÇÃO
+            # Verifica se a estrutura se mantém
             if mask_state['last_bbox']:
                 prev = mask_state['last_bbox']
                 curr = table.bbox
-                # Tolerância de 50pts no alinhamento esquerdo
-                if abs(curr[0] - prev[0]) < 50:
-                    # É continuação! Mantém o mask_x antigo
-                    mask_state['last_bbox'] = table.bbox # Atualiza a altura para a próxima
+                
+                # Critério 1: Alinhamento Esquerdo
+                aligned = abs(curr[0] - prev[0]) < 50
+                # Critério 2: Número de Colunas Similar (+- 2)
+                cols_match = abs(curr_cols - mask_state['ref_cols']) <= 2
+                
+                if aligned and cols_match:
+                    mask_state['last_bbox'] = table.bbox
                 else:
-                    # Desalinhou muito -> Assume que é outra coisa -> DESLIGA
-                    mask_state['active'] = False
-                    mask_state['mask_x'] = None
-                    mask_state['last_bbox'] = None
+                    # Mudou geometria ou nº de colunas -> Fim da tabela
+                    mask_state = {'active': False, 'mask_x': None, 'ref_cols': 0, 'last_bbox': None}
 
-        # --- FASE 3: APLICAÇÃO VISUAL ---
+        # --- DESENHO ---
         if mask_state['active'] and mask_state['mask_x'] is not None:
             cut_x = mask_state['mask_x']
             t_bbox = table.bbox
             
-            # Validação geométrica: O corte deve estar dentro (ou muito próximo) da largura da tabela
-            if t_bbox[0] < cut_x < (t_bbox[2] + 20):
+            # Verificação final de limites
+            if t_bbox[0] < cut_x < (t_bbox[2] + 50):
                 
                 x_pixel = cut_x * scale_x
                 top_pixel = t_bbox[1] * scale_y
                 bottom_pixel = t_bbox[3] * scale_y
                 right_pixel_mask = im_width 
                 
-                # 1. Retângulo Branco (Cobre tudo à direita do corte)
+                # Retângulo Branco
                 draw.rectangle(
                     [x_pixel, top_pixel, right_pixel_mask, bottom_pixel],
                     fill="white", outline=None
                 )
 
-                # 2. Linha Preta (Fecha visualmente a tabela)
+                # Linha Preta de Fechamento
                 draw.line(
                     [(x_pixel, top_pixel), (x_pixel, bottom_pixel)],
                     fill="black", width=3
                 )
                 
-                # Acabamentos horizontais
+                # Acabamento
                 draw.line([(x_pixel, top_pixel), (x_pixel - 5, top_pixel)], fill="black", width=2)
                 draw.line([(x_pixel, bottom_pixel), (x_pixel - 5, bottom_pixel)], fill="black", width=2)
-
+    
     return image, mask_state
 
 # --- FUNÇÃO DE CONVERSÃO ---
@@ -213,7 +220,6 @@ def convert_pdf_to_docx(file_bytes):
     images = convert_from_bytes(file_bytes)
     doc = Document()
     
-    # Configuração de Página
     section = doc.sections[0]
     section.page_height = Cm(29.7)
     section.page_width = Cm(21.0)
@@ -222,17 +228,12 @@ def convert_pdf_to_docx(file_bytes):
     section.top_margin = Cm(1.0)
     section.bottom_margin = Cm(0.5)
 
-    # ESTADO INICIAL (Limpo para cada arquivo)
-    mask_state = {
-        'active': False,
-        'mask_x': None,
-        'last_bbox': None
-    }
+    # ESTADO INICIAL
+    mask_state = {'active': False, 'mask_x': None, 'ref_cols': 0, 'last_bbox': None}
 
     for i, img in enumerate(images):
         if has_text_layer and pdf_plumb and i < len(pdf_plumb.pages):
-            # Passa o estado e recebe o estado atualizado
-            img, mask_state = apply_masking_v16(img, pdf_plumb.pages[i], mask_state)
+            img, mask_state = apply_masking_v17(img, pdf_plumb.pages[i], mask_state)
         
         img = img.resize((595, 842)) 
         img_byte_arr = BytesIO()
@@ -265,7 +266,7 @@ uploaded_files = st.file_uploader(
 if uploaded_files:
     st.write("---")
     if st.button(f"🚀 Processar {len(uploaded_files)} Arquivo(s)"):
-        with st.spinner('Processando tabelas multipáginas...'):
+        with st.spinner('Processando (Smart Column Check)...'):
             try:
                 processed_files = []
                 for uploaded_file in uploaded_files:
@@ -318,4 +319,4 @@ except:
     pass
 
 # --- RODAPÉ ---
-st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v16.0 (Multi-Page Persistence)</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v17.0 (Strict Columns)</div>', unsafe_allow_html=True)
