@@ -17,8 +17,7 @@ st.set_page_config(
 )
 
 # --- MODO DIAGNÓSTICO ---
-# True = Vermelho | False = Branco
-DEBUG_MODE = True 
+DEBUG_MODE = True  # True = Vermelho | False = Branco
 
 # --- ESTILO CSS ---
 hide_streamlit_style = """
@@ -63,134 +62,84 @@ a fim de inseri-las no documento SEI: **ATA DE REGISTRO DE PREÇOS**.
 
 # --- FUNÇÕES LÓGICAS ---
 
-def is_price_format(text):
-    """Detecta números decimais (ex: 100,00)"""
-    if not text: return False
-    clean = text.strip().replace(" ", "")
-    # Regex flexível: Aceita numeros com virgula e 2 digitos no final
-    match = re.search(r'[\d\.]*,\d{2}', clean)
-    if match:
-        # Filtro: garante que tem pouco ruído de letras
-        invalids = sum(1 for c in clean if c.lower() not in '0123456789.,r$()')
-        return invalids <= 2
-    return False
-
-def find_x_by_visual_scan(pdf_page):
-    """Estratégia 1: Procura pilha de números (Para Págs 2, 3, 4...)"""
-    words = pdf_page.extract_words()
-    price_words = [w for w in words if is_price_format(w['text'])]
-    
-    if not price_words: return None
-        
-    # Agrupa por coordenadas X (Cluster)
-    x_clusters = []
-    tolerance = 10 
-    
-    for w in price_words:
-        x0 = w['x0']
-        found_cluster = False
-        for cluster in x_clusters:
-            if abs(cluster['avg_x'] - x0) < tolerance:
-                cluster['points'].append(x0)
-                cluster['avg_x'] = sum(cluster['points']) / len(cluster['points'])
-                cluster['count'] += 1
-                found_cluster = True
-                break
-        if not found_cluster:
-            x_clusters.append({'avg_x': x0, 'points': [x0], 'count': 1})
-            
-    page_width = pdf_page.width
-    # Filtra clusters na direita da página
-    valid_clusters = [c for c in x_clusters if c['avg_x'] > (page_width * 0.45)]
-    
-    if not valid_clusters: return None
-        
-    best_cluster = min(valid_clusters, key=lambda c: c['avg_x'])
-    return best_cluster['avg_x']
-
-def find_x_and_y_by_header_scan(pdf_page):
+def find_anchor_geometry(pdf_page):
     """
-    Estratégia 2: Procura palavras de cabeçalho (Para Pág 1).
-    RETORNA: (x0, top) -> Coordenada X do corte e Y do início vertical.
+    Procura a palavra-chave 'QTDE' ou 'QUANTIDADE' ou 'UNID' para servir de âncora.
+    Retorna: (x_right, y_top) -> Borda direita da palavra e Borda superior.
     """
     words = pdf_page.extract_words()
+    targets = ["qtde", "qtde.", "quantidade", "quant.", "unid", "unid.", "catmat"]
     
-    # Palavras-chave que indicam o inicio da área de preço
-    target_words = ["unitário", "unitario", "estimado", "total", "(r$)", "valor"]
-    
-    found_candidates = []
+    # Filtra candidatos na metade direita da página (para evitar falsos positivos no texto)
+    candidates = []
     for w in words:
         txt = w['text'].lower().strip()
-        if any(target in txt for target in target_words):
-            # Garante que está na metade direita da página
-            if w['x0'] > (pdf_page.width * 0.4):
-                found_candidates.append(w)
+        if any(t == txt or t in txt for t in targets):
+            if w['x0'] > (pdf_page.width * 0.3): # Deve estar mais para o meio/direita
+                candidates.append(w)
     
-    if found_candidates:
-        # Pega o candidato mais à esquerda (primeira coluna de preço)
-        best = min(found_candidates, key=lambda w: w['x0'])
-        return best['x0'], best['top']
+    if candidates:
+        # Pega o que estiver mais acima (primeiro cabeçalho que aparecer)
+        best = min(candidates, key=lambda w: w['top'])
+        return best['x1'], best['top'] # x1 é a borda direita
+        
     return None, None
 
-def check_for_stoppers(pdf_page):
-    """Verifica se há palavras de parada (Texto Jurídico ou Assinatura)"""
+def check_page_signature(pdf_page):
+    """Detecta se é página de assinatura (Pág 9)"""
     text = pdf_page.extract_text().lower()
-    keys_stop = [
-        "local de entrega", "prazo de entrega", "assinatura do contrato", 
-        "garantia dos bens", "sanções administrativas", "obrigações da contratada", 
-        "fiscalização", "gestão do contrato", "cláusula", "vigência", "dotação orçamentária",
-        # NOVOS STOPPERS PARA PÁGINA 9 (ASSINATURA)
-        "documento assinado", "eletronicamente", "autenticidade", "confira no site", 
-        "https", "sítio", "código verificador", "oficial de brasília", "chave de acesso"
+    # Termos específicos de assinatura do SEI
+    signatures = [
+        "documento assinado eletronicamente", 
+        "assinado eletronicamente", 
+        "autenticidade deste documento", 
+        "código verificador", 
+        "oficial de brasília",
+        "chave de acesso"
     ]
-    return any(k in text for k in keys_stop)
+    count = sum(1 for s in signatures if s in text)
+    return count >= 1
 
-# --- FUNÇÃO DE MASCARAMENTO (v27.0 - PRECISION START & STOP) ---
-def apply_masking_v27(image, pdf_page, mask_state):
+# --- FUNÇÃO DE MASCARAMENTO (v28.0 - ANCHOR & SAFETY) ---
+def apply_masking_v28(image, pdf_page, mask_state):
     
     im_width, im_height = image.size
     
-    # Reset do Y para esta página (assumimos corte total se for continuação)
-    current_page_start_y = 0.0
-    
-    # 1. VERIFICA STOPPER (Texto Jurídico / Assinatura)
-    if check_for_stoppers(pdf_page):
+    # 1. SEGURANÇA: É PÁGINA DE ASSINATURA?
+    if check_page_signature(pdf_page):
         mask_state['active'] = False
         mask_state['cut_x_percent'] = None
-    
-    # 2. DETECÇÃO DE CORTE
-    else:
-        found_x = None
-        found_y = None
-        
-        # A) Tenta Scanner Visual (Números)
-        found_x = find_x_by_visual_scan(pdf_page)
-        
-        # B) Se falhar, tenta Scanner de Cabeçalho (Pág 1)
-        if found_x is None:
-            found_x, found_y = find_x_and_y_by_header_scan(pdf_page)
-            # Se achou pelo cabeçalho, define o ponto Y de início
-            if found_y is not None:
-                current_page_start_y = found_y / pdf_page.height
-        
-        # ATUALIZA ESTADO
-        if found_x:
-            mask_state['active'] = True
-            mask_state['cut_x_percent'] = found_x / pdf_page.width
-            
-        # Se for continuação (mask_state já era active e não achou novo header), 
-        # current_page_start_y permanece 0.0 (corte desde o topo).
+        return image.convert("RGB"), mask_state
 
-    # 3. APLICAÇÃO VISUAL
+    # 2. BUSCA ÂNCORA (QTDE)
+    anchor_x, anchor_y = find_anchor_geometry(pdf_page)
+    
+    # Variáveis de Desenho
+    draw_start_y = 0 # Padrão: Topo da página (para continuações)
+    
+    if anchor_x:
+        # ACHOU CABEÇALHO NOVO!
+        mask_state['active'] = True
+        mask_state['cut_x_percent'] = anchor_x / pdf_page.width
+        # O corte começa na altura do cabeçalho encontrados
+        draw_start_y = (anchor_y / pdf_page.height) * im_height
+        
+    # Se não achou âncora, mas está ATIVO (Págs 2, 3, 4...), mantém.
+    # E aplica uma margem superior pequena para não cortar cabeçalho de página (se houver)
+    elif mask_state['active']:
+        draw_start_y = im_height * 0.05 # 5% de margem superior segura
+
+    # 3. APLICAÇÃO
     if mask_state['active'] and mask_state['cut_x_percent']:
         draw = ImageDraw.Draw(image, "RGBA")
         
-        # Coordenada X
-        cut_x_pixel = mask_state['cut_x_percent'] * im_width
-        safe_cut_x = cut_x_pixel - 5 
+        # X: Onde cortar (convertido para px)
+        cut_x_px = mask_state['cut_x_percent'] * im_width
+        safe_cut_x = cut_x_px + 5 # +5px para direita da palavra QTDE (margem)
         
-        # Coordenada Y (Inicio)
-        cut_y_pixel = current_page_start_y * im_height
+        # Y: Altura
+        # Proteção de Rodapé: Não desenha nos últimos 5% da página
+        draw_end_y = im_height * 0.95 
         
         # Cores
         if DEBUG_MODE:
@@ -200,13 +149,13 @@ def apply_masking_v27(image, pdf_page, mask_state):
             fill = "white"
             line = "black"
 
-        # Desenha retângulo do Y encontrado até o fim da página
+        # Desenha
         draw.rectangle(
-            [safe_cut_x, cut_y_pixel, im_width, im_height],
+            [safe_cut_x, draw_start_y, im_width, draw_end_y],
             fill=fill, outline=None
         )
         
-        draw.line([(safe_cut_x, cut_y_pixel), (safe_cut_x, im_height)], fill=line, width=3)
+        draw.line([(safe_cut_x, draw_start_y), (safe_cut_x, draw_end_y)], fill=line, width=3)
 
     return image.convert("RGB"), mask_state
 
@@ -234,7 +183,7 @@ def convert_pdf_to_docx(file_bytes):
 
     for i, img in enumerate(images):
         if has_text_layer and pdf_plumb and i < len(pdf_plumb.pages):
-            img, mask_state = apply_masking_v27(img, pdf_plumb.pages[i], mask_state)
+            img, mask_state = apply_masking_v28(img, pdf_plumb.pages[i], mask_state)
         
         img = img.resize((595, 842)) 
         img_byte_arr = BytesIO()
@@ -261,10 +210,10 @@ uploaded_files = st.file_uploader("Arraste e solte seus arquivos PDF aqui:", typ
 
 if uploaded_files:
     st.write("---")
-    btn_label = "🚀 Processar (Diagnóstico Vermelho)" if DEBUG_MODE else "🚀 Processar Arquivos"
+    btn_label = "🚀 Processar (Vermelho)" if DEBUG_MODE else "🚀 Processar Arquivos"
     
     if st.button(btn_label):
-        with st.spinner('Aplicando ajustes de precisão...'):
+        with st.spinner('Processando...'):
             try:
                 processed_files = []
                 for uploaded_file in uploaded_files:
@@ -307,4 +256,4 @@ try:
 except:
     pass
 
-st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v27.0 (Precision Start & Anti-Signature)</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v28.0 (Anchor & Safety)</div>', unsafe_allow_html=True)
