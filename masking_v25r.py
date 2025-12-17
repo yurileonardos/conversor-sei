@@ -171,9 +171,19 @@ def apply_masking_v25r(image, pdf_page, state, debug=False):
     # 2️⃣ cabeçalho forte → início da tabela
     elif has_price_header(pdf_page) and not has_legal_text(pdf_page):
         header_x = find_x_by_header_scan(pdf_page)
-        if header_x:
-            state["active"] = True
-            state["cut_x"] = header_x
+
+    if header_x:
+        state["active"] = True
+        state["cut_x"] = header_x
+
+    # 🔒 fallback seguro:
+    # se já estamos dentro de uma tabela, mantém o X anterior
+    elif state.get("active") and state.get("cut_x"):
+        pass
+    else:
+        state["active"] = False
+        state["cut_x"] = None
+        return image, state
 
     # 3️⃣ nada detectado → encerra
     else:
