@@ -48,185 +48,150 @@ st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 # --- TÍTULO PRINCIPAL ---
 st.title("📑 SEI Converter ATA - SGB")
 
+# --- INTRODUÇÃO ---
 st.markdown("""
 Converta documentos PDF de **TR (Termo de Referência)** e **Proposta de Preços** em imagens otimizadas, 
 a fim de inseri-las no documento SEI: **ATA DE REGISTRO DE PREÇOS**.
 """)
 
+col1, col2 = st.columns([0.1, 0.9])
+with col1:
+    try:
+        st.image("icone_sei.png", width=40)
+    except:
+        st.write("🧩")
+with col2:
+    st.info("""
+    Funcionalidade disponível na extensão [**SEI PRO**](https://sei-pro.github.io/sei-pro/), 
+    utilizando a ferramenta [**INSERIR CONTEÚDO EXTERNO**](https://sei-pro.github.io/sei-pro/pages/INSERIRDOC.html).
+    """)
+
+with st.expander("⚙️ Deseja escolher a pasta onde o arquivo será salvo? Clique aqui."):
+    st.markdown("""
+    Por segurança, os navegadores salvam automaticamente na pasta "Downloads". 
+    Para escolher a pasta a cada download, configure seu navegador (Chrome/Edge):
+    1. Vá em **Configurações** > **Downloads**.
+    2. Ative: **"Perguntar onde salvar cada arquivo antes de fazer download"**.
+    """)
+
+st.write("---")
+
+# --- PASSO 1: UPLOAD ---
+st.write("### Passo 1: Upload dos Arquivos")
+st.markdown("**Nota:** O sistema aplicará a máscara automática para ocultar preços em Termos de Referência.")
+
+uploaded_files = st.file_uploader(
+    "Arraste e solte seus arquivos PDF aqui (ou clique para buscar):", 
+    type="pdf", 
+    accept_multiple_files=True
+)
+
 # --- FUNÇÃO AUXILIAR DE LIMPEZA DE TEXTO ---
 def clean_text(text):
     if not text: return ""
-    text = text.lower().strip()
-    # Remove pontuação básica para match
-    for ch in ['.', ':', '-', '/']:
-        text = text.replace(ch, '')
-    # Remove acentos para garantir (ex: "Preço" vira "Preco")
-    replacements = {
-        'ç': 'c', 'ã': 'a', 'á': 'a', 'à': 'a', 'é': 'e', 'ê': 'e', 
-        'í': 'i', 'ó': 'o', 'õ': 'o', 'ú': 'u'
-    }
-    for k, v in replacements.items():
-        text = text.replace(k, v)
-    return text
+    text = text.replace('\n', ' ').replace('\r', ' ')
+    return text.lower().strip()
 
-# --- FUNÇÃO DE MASCARAMENTO (v15.0 - ESTRATÉGIA MISTA & TRAVA DE TEXTO) ---
-def apply_masking_v15(image, pdf_page, mask_state):
-    """
-    mask_state guarda: {'mask_x': float, 'last_bbox': list, 'strategy': str, 'cols': int}
-    """
-    
-    # 1. Tenta achar tabelas com LINHAS (Alta precisão)
-    tables_lines = pdf_page.find_tables(table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"})
-    
-    # 2. Tenta achar tabelas por TEXTO (Baixa precisão, para tabelas sem borda)
-    tables_text = pdf_page.find_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
-    
-    # Decide qual usar nesta página
-    if tables_lines:
-        current_tables = tables_lines
-        current_strategy = 'lines'
-    else:
-        current_tables = tables_text
-        current_strategy = 'text'
+# --- FUNÇÃO DE MASCARAMENTO (LÓGICA v9.0 - CORTE VISUAL DA TABELA) ---
+def apply_masking(image, pdf_page):
+    try:
+        # Estratégias de busca de tabela
+        tables = pdf_page.find_tables(table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"})
+        if not tables:
+             tables = pdf_page.find_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
 
-    draw = ImageDraw.Draw(image)
-    im_width, im_height = image.size
-    scale_x = im_width / pdf_page.width
-    scale_y = im_height / pdf_page.height
-
-    # PALAVRAS-CHAVE
-    # Grupo 1: Cortar à DIREITA da Quantidade
-    keys_qty = ["qtde", "qtd", "quantidade", "quant", "quantitativo"]
-    
-    # Grupo 2: Cortar à ESQUERDA do Preço (Backup se Qtde falhar ou para pegar início exato)
-    keys_price = ["preco", "unitario", "estimado", "valor", "total", "maximo", "ref", "medio"]
-    
-    # Grupo 3: Parar máscara (Stopper)
-    keys_stop = ["local", "entrega", "prazo", "assinatura", "garantia", "marca", "fabricante", "validade", "pagamento"]
-
-    for table in current_tables:
-        if not table.rows: continue
+        draw = ImageDraw.Draw(image)
+        im_width, im_height = image.size
         
-        # Ignora tabelas com menos de 3 colunas (quase sempre é texto/layout)
-        num_cols = max([len(r.cells) for r in table.rows])
-        if num_cols < 3:
-            mask_state = {'mask_x': None, 'last_bbox': None, 'strategy': None, 'cols': 0}
-            continue
+        scale_x = im_width / pdf_page.width
+        scale_y = im_height / pdf_page.height
 
-        # --- ANÁLISE DE CABEÇALHO ---
-        cut_x = None
-        found_stopper = False
+        keywords_target = [
+            "preco unit", "preço unit", "valor unit", "vlr. unit", "unitario", "unitário",
+            "valor max", "valor estim", "preço estim", "preco estim", "valor ref", 
+            "vlr total", "valor total", "preco total", "preço total"
+        ]
         
-        # Analisa até 5 linhas para garantir
-        for row_idx in range(min(5, len(table.rows))):
-            row_cells = table.rows[row_idx].cells
-            for cell_idx, cell in enumerate(row_cells):
-                if not cell: continue
-                try:
-                    cropped = pdf_page.crop(cell)
-                    text = clean_text(cropped.extract_text())
-                    
-                    # 1. STOPPER
-                    if any(k in text for k in keys_stop):
-                        found_stopper = True
-                        break
+        for table in tables:
+            if not table.rows: continue
 
-                    # 2. PREÇO (Esquerda) - Prioridade alta para pegar o Grupo 1 se Qtde falhar
-                    # Se achar "Preço Unitário", corta na esquerda dele
-                    if any(k in text for k in keys_price):
-                        # Validação: Preço geralmente está na metade direita da tabela
-                        # Se estiver muito à esquerda, pode ser falso positivo
-                        if cell[0] > table.bbox[0] + (table.bbox[2] - table.bbox[0]) * 0.4:
-                            cut_x = cell[0] # Borda ESQUERDA
-                            break
+            # --- 1. LOCALIZAR A COLUNA DE PREÇO ---
+            mask_start_x = None
 
-                    # 3. QUANTIDADE (Direita)
-                    if cut_x is None and any(k == text or k in text.split() for k in keys_qty):
-                        cut_x = cell[2] # Borda DIREITA
+            # Varre as primeiras linhas (cabeçalho)
+            for row_idx in range(min(3, len(table.rows))):
+                row_cells = table.rows[row_idx].cells
+                for cell_idx, cell in enumerate(row_cells):
+                    if not cell: continue
+                    try:
+                        cropped = pdf_page.crop(cell)
+                        text_raw = cropped.extract_text()
+                        text_clean = clean_text(text_raw)
                         
-                except:
-                    pass
-            if cut_x or found_stopper: break
-
-        # --- ATUALIZAÇÃO DO ESTADO ---
-        active_cut_x = None
-
-        if found_stopper:
-            # Encontrou tabela de texto (Local, Prazo) -> Reseta tudo
-            mask_state = {'mask_x': None, 'last_bbox': None, 'strategy': None, 'cols': 0}
-        
-        elif cut_x is not None:
-            # ACHOU CABEÇALHO NOVO!
-            mask_state['mask_x'] = cut_x
-            mask_state['last_bbox'] = table.bbox
-            mask_state['strategy'] = current_strategy
-            mask_state['cols'] = num_cols
-            active_cut_x = cut_x
-        
-        else:
-            # SEM CABEÇALHO (Possível Continuação)
-            if mask_state['mask_x'] is not None and mask_state['last_bbox']:
-                
-                # --- CHECAGEM RIGOROSA DE CONTINUIDADE ---
-                prev = mask_state['last_bbox']
-                curr = table.bbox
-                
-                # 1. Checagem de Estratégia (CRÍTICO PARA A PÁGINA 7)
-                # Se a anterior era 'lines' (tabela real) e a atual é 'text' (texto solto), NÃO É CONTINUAÇÃO.
-                if mask_state['strategy'] == 'lines' and current_strategy == 'text':
-                    active_cut_x = None
-                    # Reseta para evitar danos futuros
-                    mask_state = {'mask_x': None, 'last_bbox': None, 'strategy': None, 'cols': 0}
-                
-                # 2. Checagem de Colunas
-                # Se o número de colunas mudou drasticamente, não é a mesma tabela
-                elif abs(num_cols - mask_state['cols']) > 2:
-                    active_cut_x = None
-                    mask_state = {'mask_x': None, 'last_bbox': None, 'strategy': None, 'cols': 0}
-                
-                # 3. Checagem Geométrica (Alinhamento)
-                # Alinhamento esquerdo e largura similares
-                elif abs(curr[0] - prev[0]) < 50 and abs((curr[2]-curr[0]) - (prev[2]-prev[0])) < 50:
-                    active_cut_x = mask_state['mask_x']
-                    mask_state['last_bbox'] = table.bbox # Atualiza bbox
-                    # Mantém estratégia e cols da original
-                else:
-                    # Desalinhou -> Reseta
-                    mask_state = {'mask_x': None, 'last_bbox': None, 'strategy': None, 'cols': 0}
-
-        # --- APLICAÇÃO DA MÁSCARA ---
-        if active_cut_x is not None:
-            t_bbox = table.bbox
+                        if any(k in text_clean for k in keywords_target):
+                            # Encontrou a coluna proibida!
+                            mask_start_x = cell[0] 
+                            break 
+                    except:
+                        pass
+                if mask_start_x is not None:
+                    break
             
-            # Segurança: Corte deve estar dentro da tabela
-            if t_bbox[0] < active_cut_x < t_bbox[2]:
+            # --- 2. APLICAR MÁSCARA E FECHAR A TABELA ---
+            if mask_start_x is not None:
+                table_rect = table.bbox # (x0, top, x1, bottom)
                 
-                x_pixel = active_cut_x * scale_x
-                top_pixel = t_bbox[1] * scale_y
-                bottom_pixel = t_bbox[3] * scale_y
-                # Vai até a direita da IMAGEM (para cobrir vazamentos) mas visualmente fecha na tabela
-                right_pixel_mask = im_width 
-                
-                # 1. Retângulo Branco (Apaga os dados)
-                draw.rectangle(
-                    [x_pixel, top_pixel, right_pixel_mask, bottom_pixel],
-                    fill="white", outline=None
-                )
+                # A) A "Borracha" (Retângulo Branco)
+                rect_mask = [
+                    mask_start_x * scale_x,       
+                    table_rect[1] * scale_y,      
+                    table_rect[2] * scale_x + 50, # Vai um pouco além da direita original
+                    table_rect[3] * scale_y       
+                ]
+                draw.rectangle(rect_mask, fill="white", outline=None)
 
-                # 2. Linha Preta (Fecha a tabela visualmente)
-                # Linha vertical grossa
-                draw.line(
-                    [(x_pixel, top_pixel), (x_pixel, bottom_pixel)],
-                    fill="black", width=3
-                )
-                
-                # Linhas de acabamento superior/inferior (pequenos traços para a esquerda)
-                draw.line([(x_pixel, top_pixel), (x_pixel - 5, top_pixel)], fill="black", width=2)
-                draw.line([(x_pixel, bottom_pixel), (x_pixel - 5, bottom_pixel)], fill="black", width=2)
+                # B) A Nova Borda (Retângulo Preto) - Corta visualmente a tabela
+                rect_border = [
+                    table_rect[0] * scale_x,    # Esquerda da tabela
+                    table_rect[1] * scale_y,    # Topo
+                    mask_start_x * scale_x,     # Direita (NOVO LIMITE VISUAL)
+                    table_rect[3] * scale_y     # Fundo
+                ]
+                draw.rectangle(rect_border, outline="black", width=2)
 
-    return image, mask_state
+            # --- 3. LIMPEZA FINAL DE LINHAS DE TOTAL ---
+            last_row = table.rows[-1]
+            try:
+                first_cell = last_row.cells[0]
+                if first_cell:
+                    cropped_last = pdf_page.crop(first_cell)
+                    last_text = clean_text(cropped_last.extract_text())
+                    
+                    if "total" in last_text:
+                        tops = [c[1] for c in last_row.cells if c]
+                        bottoms = [c[3] for c in last_row.cells if c]
+                        
+                        if tops and bottoms:
+                            l_top = min(tops)
+                            l_bottom = max(bottoms)
+                            
+                            # Apaga a linha de total inteira visualmente
+                            rect_total = [
+                                table.bbox[0] * scale_x,
+                                l_top * scale_y,
+                                mask_start_x * scale_x if mask_start_x else table.bbox[2] * scale_x, 
+                                l_bottom * scale_y
+                            ]
+                            draw.rectangle(rect_total, fill="white", outline="black", width=2)
+            except:
+                pass
 
-# --- FUNÇÃO DE CONVERSÃO ---
+    except Exception as e:
+        pass
+    
+    return image
+
+# --- FUNÇÃO DE CONVERSÃO (LÓGICA v9.0 - ANTI PÁGINA EM BRANCO) ---
 def convert_pdf_to_docx(file_bytes):
     try:
         pdf_plumb = pdfplumber.open(BytesIO(file_bytes))
@@ -238,6 +203,7 @@ def convert_pdf_to_docx(file_bytes):
     images = convert_from_bytes(file_bytes)
     doc = Document()
     
+    # Configuração de Margens Estreitas
     section = doc.sections[0]
     section.page_height = Cm(29.7)
     section.page_width = Cm(21.0)
@@ -246,18 +212,18 @@ def convert_pdf_to_docx(file_bytes):
     section.top_margin = Cm(1.0)
     section.bottom_margin = Cm(0.5)
 
-    # Estado Inicial
-    mask_state = {'mask_x': None, 'last_bbox': None, 'strategy': None, 'cols': 0}
-
     for i, img in enumerate(images):
         if has_text_layer and pdf_plumb and i < len(pdf_plumb.pages):
-            img, mask_state = apply_masking_v15(img, pdf_plumb.pages[i], mask_state)
+            img = apply_masking(img, pdf_plumb.pages[i])
         
+        # Otimização de tamanho
         img = img.resize((595, 842)) 
+        
         img_byte_arr = BytesIO()
-        img.save(img_byte_arr, format='JPEG', quality=85, optimize=True)
+        img.save(img_byte_arr, format='JPEG', quality=80, optimize=True)
         img_byte_arr.seek(0)
 
+        # Inserção no Word com largura reduzida (18cm)
         doc.add_picture(img_byte_arr, width=Cm(18.0))
         
         par = doc.paragraphs[-1]
@@ -265,6 +231,7 @@ def convert_pdf_to_docx(file_bytes):
         par.paragraph_format.space_before = Pt(0)
         par.paragraph_format.space_after = Pt(0)
         
+        # Quebra de página apenas se não for a última imagem
         if i < len(images) - 1:
             doc.add_page_break()
     
@@ -273,37 +240,48 @@ def convert_pdf_to_docx(file_bytes):
     docx_io.seek(0)
     return docx_io
 
-# --- PASSO 1: UPLOAD ---
-uploaded_files = st.file_uploader(
-    "Arraste e solte seus arquivos PDF aqui:", 
-    type="pdf", 
-    accept_multiple_files=True
-)
-
 # --- PASSO 2: PROCESSAR ---
 if uploaded_files:
     st.write("---")
-    if st.button(f"🚀 Processar {len(uploaded_files)} Arquivo(s)"):
-        with st.spinner('Processando...'):
+    st.write("### Passo 2: Converter e Download")
+    
+    qtd = len(uploaded_files)
+    st.caption(f"{qtd} arquivo(s) pronto(s) para conversão.")
+
+    if st.button(f"🚀 Processar Arquivos"):
+        with st.spinner('Ajustando tabelas e convertendo...'):
             try:
                 processed_files = []
-                for uploaded_file in uploaded_files:
+                progress_bar = st.progress(0)
+                
+                for index, uploaded_file in enumerate(uploaded_files):
                     docx_data = convert_pdf_to_docx(uploaded_file.read())
                     file_name = uploaded_file.name.replace('.pdf', '') + "_SEI_SGB.docx"
                     processed_files.append((file_name, docx_data))
+                    progress_bar.progress((index + 1) / qtd)
 
-                st.success("✅ Concluído!")
+                st.success("✅ Conversão concluída!")
                 
                 if len(processed_files) == 1:
                     name, data = processed_files[0]
-                    st.download_button("📥 Baixar Arquivo DOCX", data, file_name=name, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                    st.download_button(
+                        label=f"📥 Salvar {name} no Computador",
+                        data=data,
+                        file_name=name,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    )
                 else:
                     zip_buffer = BytesIO()
                     with zipfile.ZipFile(zip_buffer, "w") as zf:
                         for name, data in processed_files:
                             zf.writestr(name, data.getvalue())
                     zip_buffer.seek(0)
-                    st.download_button("📥 Baixar Todos (.ZIP)", zip_buffer, "Arquivos_SEI.zip", mime="application/zip")
+                    st.download_button(
+                        label="📥 Salvar Todos (.ZIP) no Computador",
+                        data=zip_buffer,
+                        file_name="Documentos_SEI_Convertidos.zip",
+                        mime="application/zip"
+                    )
 
             except Exception as e:
                 st.error(f"Erro: {e}")
@@ -337,4 +315,4 @@ except:
     pass
 
 # --- RODAPÉ ---
-st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v15.0 (Precision Fix)</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v8.1</div>', unsafe_allow_html=True)
