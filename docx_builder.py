@@ -27,7 +27,7 @@ def build_docx(tr_bytes, proposal_files, debug=False):
     state = {"active": False, "cut_x": None}
 
     for page, img in zip(pdf_pages, images):
-        img, state = apply_masking_v25r(img, page, state, debug=debug)
+        img, state = apply_masking_v25r(img, page, state, debug=false)
         processed.append(img)
 
     
