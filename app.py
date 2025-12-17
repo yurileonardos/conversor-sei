@@ -17,7 +17,7 @@ st.set_page_config(
 )
 
 # --- MODO DIAGNÓSTICO ---
-# Mude para False quando validar que a Pág 1 funcionou
+# Mude para False para a versão final (Branca)
 DEBUG_MODE = True 
 
 # --- ESTILO CSS ---
@@ -54,7 +54,7 @@ st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 st.title("📑 SEI Converter ATA - SGB")
 
 if DEBUG_MODE:
-    st.warning("🔴 MODO DIAGNÓSTICO ATIVADO. Máscaras em VERMELHO.")
+    st.warning("🔴 MODO DIAGNÓSTICO: Máscaras em VERMELHO (Respeitando altura da tabela).")
 
 st.markdown("""
 Converta documentos PDF de **TR (Termo de Referência)** e **Proposta de Preços** em imagens otimizadas, 
@@ -63,135 +63,198 @@ a fim de inseri-las no documento SEI: **ATA DE REGISTRO DE PREÇOS**.
 
 # --- FUNÇÕES LÓGICAS ---
 
-def is_price_format(text):
-    """Detecta números decimais (ex: 100,00)"""
+def clean_text(text):
+    if not text: return ""
+    return str(text).strip()
+
+def is_numeric_decimal(text):
+    """
+    Identifica células que são CLARAMENTE valores monetários.
+    Ex: 100,00 | 1.520,50 | R$ 50,00
+    Rejeita: Datas, Leis (14.133), Inteiros (50)
+    """
     if not text: return False
-    clean = text.strip().replace(" ", "")
-    # Regex flexível: Aceita numeros com virgula e 2 digitos no final
-    match = re.search(r'[\d\.]*,\d{2}', clean)
+    clean = text.replace(" ", "")
+    # Regex: Numeros (com pontos opcionais) + Virgula + 2 Digitos no final
+    match = re.search(r'[\d\.]*,\d{2}$', clean)
     if match:
-        # Filtro: garante que tem pouco ruído de letras
-        invalids = sum(1 for c in clean if c.lower() not in '0123456789.,r$()')
-        return invalids <= 2
+        # Filtro anti-falso positivo (ex: Lei 8.666/93 não passa)
+        # Se tiver caracteres que não sejam numeros, pontos, virgulas ou R$, rejeita.
+        if any(c for c in clean if c.lower() not in '0123456789.,r$'):
+            return False
+        return True
     return False
 
-def find_x_by_visual_scan(pdf_page):
-    """Estratégia 1: Procura pilha de números (Para Págs 2, 3, 4...)"""
-    words = pdf_page.extract_words()
-    price_words = [w for w in words if is_price_format(w['text'])]
+def check_structure_and_stop(table, pdf_page):
+    """
+    Verifica se a tabela é válida para mascaramento.
+    Retorna False se for Assinatura, Texto Jurídico ou tiver poucas colunas.
+    """
+    # 1. Checagem de Colunas (Elimina Pág 9)
+    # Tabelas de itens têm Item, Descrição, Unid, Qtd, Valor... (Minimo 3 colunas visualmente)
+    max_cols = 0
+    if table.rows:
+        max_cols = max([len(r.cells) for r in table.rows])
     
-    if not price_words: return None
-        
-    # Agrupa por coordenadas X (Cluster)
-    x_clusters = []
-    tolerance = 10 # Aumentei a tolerância para 10px
-    
-    for w in price_words:
-        x0 = w['x0']
-        found_cluster = False
-        for cluster in x_clusters:
-            if abs(cluster['avg_x'] - x0) < tolerance:
-                cluster['points'].append(x0)
-                cluster['avg_x'] = sum(cluster['points']) / len(cluster['points'])
-                cluster['count'] += 1
-                found_cluster = True
-                break
-        if not found_cluster:
-            x_clusters.append({'avg_x': x0, 'points': [x0], 'count': 1})
-            
-    # Filtra clusters (precisa estar na direita da página)
-    # Reduzi exigência de count para 1 caso seja uma linha única muito clara
-    page_width = pdf_page.width
-    valid_clusters = [c for c in x_clusters if c['avg_x'] > (page_width * 0.45)]
-    
-    if not valid_clusters: return None
-        
-    # Pega o cluster mais à esquerda
-    best_cluster = min(valid_clusters, key=lambda c: c['avg_x'])
-    return best_cluster['avg_x']
+    if max_cols < 3:
+        return False # Ignora tabelas de assinatura ou layout simples
 
-def find_x_by_header_scan(pdf_page):
-    """Estratégia 2: Procura palavras de cabeçalho (Para Pág 1)"""
-    words = pdf_page.extract_words()
+    # 2. Checagem de Texto (Stopwords)
+    keys_stop = [
+        "local de entrega", "prazo", "assinatura", "garantia", "sanções", 
+        "obrigações", "fiscalização", "gestão", "cláusula", "vigência", 
+        "dotação", "assinado", "eletronicamente", "testemunhas", "foro"
+    ]
     
-    # Palavras-chave que indicam o inicio da área de preço
-    target_words = ["unitário", "unitario", "estimado", "total", "(r$)", "(r$)"]
+    # Amostra de texto da tabela
+    sample_txt = ""
+    for r in table.rows[:5]: # Olha as primeiras 5 linhas
+        for c in r.cells:
+            if c:
+                try:
+                    crop = pdf_page.crop(c)
+                    sample_txt += crop.extract_text().lower() + " "
+                except: pass
     
-    found_candidates = []
-    for w in words:
-        txt = w['text'].lower().strip()
-        if any(target in txt for target in target_words):
-            # Garante que está na metade direita da página
-            if w['x0'] > (pdf_page.width * 0.4):
-                found_candidates.append(w['x0'])
+    if any(k in sample_txt for k in keys_stop):
+        return False
+        
+    return True
+
+def find_cut_x_in_table(table, pdf_page):
+    """
+    Encontra a coordenada X onde começa a área de preço dentro de uma tabela específica.
+    Usa abordagem híbrida: Conteúdo Numérico OU Cabeçalho.
+    """
+    found_x = None
     
-    if found_candidates:
-        # Retorna o X mais à esquerda encontrado (provavelmente "Unitário")
-        return min(found_candidates)
+    # A) ESTRATÉGIA DE CONTEÚDO (Varre colunas procurando números decimais)
+    # Analisa coluna por coluna (transversal)
+    max_cols = max([len(r.cells) for r in table.rows])
+    
+    # Itera sobre índices de coluna (0, 1, 2...)
+    for col_idx in range(max_cols):
+        decimal_hits = 0
+        valid_cells = 0
+        col_x = None
+        
+        # Olha as primeiras 10 linhas
+        for r_idx in range(min(10, len(table.rows))):
+            try:
+                row_cells = table.rows[r_idx].cells
+                if col_idx < len(row_cells):
+                    cell = row_cells[col_idx]
+                    if cell and isinstance(cell, (list, tuple)):
+                        if col_x is None: col_x = cell[0] # Pega X da borda esquerda
+                        
+                        crop = pdf_page.crop(cell)
+                        txt = clean_text(crop.extract_text())
+                        if txt:
+                            valid_cells += 1
+                            if is_numeric_decimal(txt):
+                                decimal_hits += 1
+            except: pass
+        
+        # Se a coluna tem >50% de numeros decimais, é Preço
+        if valid_cells > 0 and decimal_hits >= 1: # Flexibilizei para 1 hit se for claro
+             ratio = decimal_hits / valid_cells
+             if ratio >= 0.5:
+                 # Validação: Deve estar na direita (>40% da página)
+                 if col_x and col_x > (pdf_page.width * 0.4):
+                     return col_x
+
+    # B) ESTRATÉGIA DE CABEÇALHO (Backup para Pág 1 se não tiver dados suficientes)
+    keys_header = ["unitário", "unitario", "estimado", "total", "(r$)", "valor"]
+    
+    for r in table.rows[:3]: # Primeiras 3 linhas
+        for cell in r.cells:
+            try:
+                if cell and isinstance(cell, (list, tuple)):
+                    crop = pdf_page.crop(cell)
+                    txt = str(crop.extract_text()).lower()
+                    if any(k in txt for k in keys_header):
+                         # Verifica posição
+                         if cell[0] > (pdf_page.width * 0.4):
+                             return cell[0] # Borda Esquerda
+            except: pass
+            
     return None
 
-def check_for_stoppers(pdf_page):
-    """Verifica se há palavras de parada (Texto Jurídico)"""
-    text = pdf_page.extract_text().lower()
-    keys_stop = [
-        "local de entrega", "prazo de entrega", "assinatura do contrato", 
-        "garantia dos bens", "sanções administrativas", "obrigações da contratada", 
-        "fiscalização", "gestão do contrato", "cláusula", "vigência", "dotação orçamentária"
-    ]
-    return any(k in text for k in keys_stop)
-
-# --- FUNÇÃO DE MASCARAMENTO (v25.0 - HÍBRIDA) ---
-def apply_masking_v25(image, pdf_page, mask_state):
+# --- FUNÇÃO DE MASCARAMENTO (v26.0 - BOUNDED MASK) ---
+def apply_masking_v26(image, pdf_page, mask_state):
     
+    # Busca todas as tabelas (Linhas e Texto)
+    tables_lines = pdf_page.find_tables(table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"})
+    tables_text = pdf_page.find_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
+    all_tables = tables_lines if tables_lines else tables_text
+
+    draw = ImageDraw.Draw(image, "RGBA") 
     im_width, im_height = image.size
     
-    # 1. VERIFICA STOPPER (Texto Jurídico)
-    if check_for_stoppers(pdf_page):
-        mask_state['active'] = False
-        mask_state['cut_x_percent'] = None
-    
-    # 2. DETECÇÃO DE CORTE
-    else:
-        found_x = None
+    scale_x = im_width / pdf_page.width
+    scale_y = im_height / pdf_page.height
+
+    for table in all_tables:
+        if not table.rows: continue
         
-        # A) Tenta Scanner Visual (Prioridade: Números Reais)
-        found_x = find_x_by_visual_scan(pdf_page)
+        # 1. VALIDAÇÃO DE ESTRUTURA (Resolve Pág 9 e Textos)
+        is_valid = check_structure_and_stop(table, pdf_page)
         
-        # B) Se falhar (Pág 1 com poucos itens), tenta Scanner de Cabeçalho
-        if found_x is None:
-            found_x = find_x_by_header_scan(pdf_page)
-        
-        # ATUALIZA ESTADO
-        if found_x:
-            mask_state['active'] = True
-            mask_state['cut_x_percent'] = found_x / pdf_page.width
+        if not is_valid:
+            # Se a tabela é inválida (assinatura, texto), e a máscara estava ativa,
+            # verificamos se devemos desligar.
+            # Se for uma mudança brusca de estrutura (ex: 5 cols -> 1 col), desliga.
+            cols = max([len(r.cells) for r in table.rows])
+            if cols < 3:
+                mask_state['active'] = False
+                mask_state['cut_x_percent'] = None
+            continue # Pula para a próxima tabela sem desenhar nada nesta
             
-        # Se não achou nada nesta página, mantém o estado anterior (Herança)
-        # a menos que pareça uma página vazia/texto (Stopper cuida disso)
+        # 2. LOCALIZAÇÃO DO CORTE (Resolve Pág 1 e Continuações)
+        cut_x = find_cut_x_in_table(table, pdf_page)
+        
+        if cut_x:
+            mask_state['active'] = True
+            mask_state['cut_x_percent'] = cut_x / pdf_page.width
+        
+        # 3. APLICAÇÃO VISUAL (Resolve Pág 1 - Limites Verticais)
+        if mask_state['active'] and mask_state['cut_x_percent']:
+            
+            # Coordenadas Horizontais
+            cut_x_pixel = mask_state['cut_x_percent'] * im_width
+            safe_cut_x = cut_x_pixel - 5 
+            
+            # Coordenadas Verticais (LIMITADAS À TABELA)
+            # Usa o bbox da tabela para definir onde começa e termina o vermelho
+            t_bbox = table.bbox # (x0, top, x1, bottom)
+            top_pixel = t_bbox[1] * scale_y
+            bottom_pixel = t_bbox[3] * scale_y
+            
+            # Validação geométrica: O corte deve estar dentro da tabela
+            t_x0_pixel = t_bbox[0] * scale_x
+            if cut_x_pixel > t_x0_pixel:
+                
+                # Cores
+                if DEBUG_MODE:
+                    fill = (255, 0, 0, 100) # Vermelho
+                    line = "red"
+                else:
+                    fill = "white"
+                    line = "black"
 
-    # 3. APLICAÇÃO VISUAL
-    if mask_state['active'] and mask_state['cut_x_percent']:
-        draw = ImageDraw.Draw(image, "RGBA")
-        
-        cut_x_pixel = mask_state['cut_x_percent'] * im_width
-        
-        # Recuo de segurança (-5px) para garantir que cobre o início do número/texto
-        safe_cut_x = cut_x_pixel - 5 
-        
-        # Cores
-        if DEBUG_MODE:
-            fill = (255, 0, 0, 100)
-            line = "red"
-        else:
-            fill = "white"
-            line = "black"
-
-        draw.rectangle(
-            [safe_cut_x, 0, im_width, im_height],
-            fill=fill, outline=None
-        )
-        
-        draw.line([(safe_cut_x, 0), (safe_cut_x, im_height)], fill=line, width=3)
+                # Desenha o retângulo APENAS dentro dos limites da tabela
+                draw.rectangle(
+                    [safe_cut_x, top_pixel, im_width, bottom_pixel],
+                    fill=fill, outline=None
+                )
+                
+                # Linha Vertical
+                draw.line([(safe_cut_x, top_pixel), (safe_cut_x, bottom_pixel)], fill=line, width=3)
+                
+                # Acabamento (linhas horizontais no topo e base da máscara)
+                if not DEBUG_MODE:
+                    draw.line([(safe_cut_x, top_pixel), (safe_cut_x - 5, top_pixel)], fill="black", width=2)
+                    draw.line([(safe_cut_x, bottom_pixel), (safe_cut_x - 5, bottom_pixel)], fill="black", width=2)
 
     return image.convert("RGB"), mask_state
 
@@ -207,6 +270,7 @@ def convert_pdf_to_docx(file_bytes):
     images = convert_from_bytes(file_bytes)
     doc = Document()
     
+    # Configuração A4
     section = doc.sections[0]
     section.page_height = Cm(29.7)
     section.page_width = Cm(21.0)
@@ -219,7 +283,7 @@ def convert_pdf_to_docx(file_bytes):
 
     for i, img in enumerate(images):
         if has_text_layer and pdf_plumb and i < len(pdf_plumb.pages):
-            img, mask_state = apply_masking_v25(img, pdf_plumb.pages[i], mask_state)
+            img, mask_state = apply_masking_v26(img, pdf_plumb.pages[i], mask_state)
         
         img = img.resize((595, 842)) 
         img_byte_arr = BytesIO()
@@ -246,10 +310,10 @@ uploaded_files = st.file_uploader("Arraste e solte seus arquivos PDF aqui:", typ
 
 if uploaded_files:
     st.write("---")
-    btn_label = "🚀 Processar (Diagnóstico Vermelho)" if DEBUG_MODE else "🚀 Processar Arquivos"
+    btn_label = "🚀 Processar (Diagnóstico Final)" if DEBUG_MODE else "🚀 Processar Arquivos"
     
     if st.button(btn_label):
-        with st.spinner('Aplicando estratégia híbrida (Visual + Cabeçalho)...'):
+        with st.spinner('Processando...'):
             try:
                 processed_files = []
                 for uploaded_file in uploaded_files:
@@ -292,4 +356,4 @@ try:
 except:
     pass
 
-st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v25.0 (Hybrid Fix)</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v26.0 (Bounded & Specific)</div>', unsafe_allow_html=True)
