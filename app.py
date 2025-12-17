@@ -7,6 +7,7 @@ from io import BytesIO
 import zipfile
 import pdfplumber
 from PIL import ImageDraw
+import re
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
@@ -78,7 +79,7 @@ st.write("---")
 
 # --- PASSO 1: UPLOAD ---
 st.write("### Passo 1: Upload dos Arquivos")
-st.markdown("**Nota:** O sistema detectará automaticamente tabelas no TR e ocultará as colunas de valores estimados e a linha de total.")
+st.markdown("**Nota:** O sistema aplicará a máscara automática para ocultar preços em Termos de Referência.")
 
 uploaded_files = st.file_uploader(
     "Arraste e solte seus arquivos PDF aqui (ou clique para buscar):", 
@@ -86,124 +87,129 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-# --- FUNÇÃO DE MASCARAMENTO (CALIBRADA v7) ---
+# --- FUNÇÃO AUXILIAR DE LIMPEZA DE TEXTO ---
+def clean_text(text):
+    if not text: return ""
+    # Substitui quebras de linha por espaço, remove pontuação extra e poe minusculo
+    text = text.replace('\n', ' ').replace('\r', ' ')
+    return text.lower().strip()
+
+# --- FUNÇÃO DE MASCARAMENTO (CALIBRADA v8.0) ---
 def apply_masking(image, pdf_page):
-    """
-    Estratégia: Localizar o X da coluna alvo e mascarar toda a área à direita.
-    Localizar a última linha 'Total' e mascarar toda a área inferior.
-    """
     try:
-        # Configurações para pegar tabelas mesmo com linhas falhas
+        # Tenta estratégia de LINHAS (comum em governo)
         tables = pdf_page.find_tables(table_settings={"vertical_strategy": "lines", "horizontal_strategy": "lines"})
         
+        # Se não achar nada, tenta estratégia de TEXTO (para tabelas sem borda)
+        if not tables:
+             tables = pdf_page.find_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
+
         draw = ImageDraw.Draw(image)
         im_width, im_height = image.size
         
-        # Fator de escala (PDF Points -> Imagem Pixels)
         scale_x = im_width / pdf_page.width
         scale_y = im_height / pdf_page.height
 
-        # Palavras-chave exatas do seu documento + variações
-        keywords_target = ["preço unitário", "valor unitário", "vlr. unit", "unitário"]
+        # Palavras-chave Agressivas (com e sem acento)
+        keywords_target = [
+            "preco unit", "preço unit", "valor unit", "vlr. unit", "unitario", "unitário",
+            "valor max", "valor estim", "preço estim", "preco estim", "valor ref", 
+            "vlr total", "valor total", "preco total", "preço total"
+        ]
+        
         keyword_total_row = "total"
 
         for table in tables:
-            # Pega o texto da primeira linha (cabeçalho)
-            # table.rows[0].cells fornece as coordenadas das células do cabeçalho
-            if not table.rows:
-                continue
+            if not table.rows: continue
 
-            header_cells = table.rows[0].cells
-            # Extrai texto usando o pdf_page.crop para garantir leitura correta
-            header_texts = []
-            for cell in header_cells:
-                if cell:
-                    # cell é (x0, top, x1, bottom)
-                    try:
-                        cropped = pdf_page.crop(cell)
-                        text = cropped.extract_text()
-                        header_texts.append(text.lower() if text else "")
-                    except:
-                        header_texts.append("")
-                else:
-                    header_texts.append("")
-            
-            # 1. IDENTIFICAR ONDE COMEÇA O CORTE VERTICAL
+            # --- 1. LOCALIZAR CABEÇALHO ---
+            # Vamos varrer as primeiras 3 linhas para achar o cabeçalho (as vezes tem titulo antes)
+            header_found_idx = -1
             mask_start_x = None
-            
-            for i, text in enumerate(header_texts):
-                # Se encontrar "preço unitário" ou similar
-                if any(k in text for k in keywords_target):
-                    # Pega o X0 (início) dessa célula
-                    cell_coords = header_cells[i]
-                    if cell_coords:
-                        mask_start_x = cell_coords[0]
-                        break # Achou a primeira coluna de valor, para aqui e mascara tudo à direita
-            
-            # Se achou a coluna, desenha a TARJA VERTICAL
-            if mask_start_x is not None:
-                # Coordenadas da tabela inteira
-                table_top = table.bbox[1]
-                table_bottom = table.bbox[3]
-                table_right = table.bbox[2]
+
+            for row_idx in range(min(3, len(table.rows))):
+                row_cells = table.rows[row_idx].cells
                 
-                # Retângulo: Do início da coluna Unitário até o fim da tabela (direita)
-                # E do topo da tabela até o fim da tabela
+                # Verifica cada célula dessa linha
+                for cell_idx, cell in enumerate(row_cells):
+                    if not cell: continue
+                    
+                    try:
+                        # Extrai texto da área
+                        cropped = pdf_page.crop(cell)
+                        text_raw = cropped.extract_text()
+                        text_clean = clean_text(text_raw)
+                        
+                        # Verifica se bate com as palavras chave
+                        if any(k in text_clean for k in keywords_target):
+                            # BINGO! Achamos a coluna de preço
+                            mask_start_x = cell[0] # Pega a coordenada X da esquerda
+                            header_found_idx = row_idx
+                            break 
+                    except:
+                        pass
+                
+                if mask_start_x is not None:
+                    break # Para de procurar cabeçalho se já achou
+            
+            # --- 2. APLICAR MÁSCARA VERTICAL (COLUNAS) ---
+            if mask_start_x is not None:
+                # Desenha um retângulo branco do inicio da coluna encontrada até o fim da tabela
+                table_rect = table.bbox
                 rect = [
-                    mask_start_x * scale_x,
-                    table_top * scale_y,
-                    table_right * scale_x, # Vai até a borda direita da tabela
-                    table_bottom * scale_y
+                    mask_start_x * scale_x,       # Começa na coluna de preço
+                    table_rect[1] * scale_y,      # Topo da tabela
+                    table_rect[2] * scale_x + 50, # Fim da tabela (soma +50px pra garantir borda)
+                    table_rect[3] * scale_y       # Fundo da tabela
                 ]
-                # Desenha branco
                 draw.rectangle(rect, fill="white", outline="white")
 
-            # 2. IDENTIFICAR LINHA DE TOTAL (TARJA HORIZONTAL)
+            # --- 3. APLICAR MÁSCARA HORIZONTAL (TOTAL) ---
             # Verifica a última linha
             last_row = table.rows[-1]
-            last_row_text = ""
-            
-            # Tenta ler o texto da primeira célula da última linha
             try:
-                if last_row.cells[0]:
-                    cropped_last = pdf_page.crop(last_row.cells[0])
-                    last_row_text = cropped_last.extract_text().lower() if cropped_last.extract_text() else ""
+                # Pega texto da linha inteira (ou primeira celula)
+                first_cell = last_row.cells[0]
+                if first_cell:
+                    cropped_last = pdf_page.crop(first_cell)
+                    last_text = clean_text(cropped_last.extract_text())
+                    
+                    if "total" in last_text:
+                        # Pega bbox da linha (usando as células para calcular altura)
+                        tops = [c[1] for c in last_row.cells if c]
+                        bottoms = [c[3] for c in last_row.cells if c]
+                        
+                        if tops and bottoms:
+                            l_top = min(tops)
+                            l_bottom = max(bottoms)
+                            
+                            rect_total = [
+                                table.bbox[0] * scale_x, # Esquerda da tabela
+                                l_top * scale_y,         # Topo da linha
+                                table.bbox[2] * scale_x, # Direita da tabela
+                                l_bottom * scale_y       # Fundo da linha
+                            ]
+                            draw.rectangle(rect_total, fill="white", outline="white")
             except:
                 pass
-            
-            # Se a palavra TOTAL estiver na última linha (geralmente na primeira célula ou mesclada)
-            # Ou se a linha anterior for dados e essa for resumo
-            if keyword_total_row in last_row_text:
-                # Coordenadas da última linha inteira
-                # Nota: table.rows[-1] é um objeto Row, precisamos pegar o bbox dele ou das células
-                # O pdfplumber Row não tem bbox direto, pegamos min/max das células
-                l_top = min(c[1] for c in last_row.cells if c)
-                l_bottom = max(c[3] for c in last_row.cells if c)
-                l_left = table.bbox[0]
-                l_right = table.bbox[2]
-                
-                rect_total = [
-                    l_left * scale_x,
-                    l_top * scale_y,
-                    l_right * scale_x,
-                    l_bottom * scale_y
-                ]
-                draw.rectangle(rect_total, fill="white", outline="white")
 
     except Exception as e:
-        print(f"Erro no mascaramento: {e}")
+        print(f"Erro mascaramento: {e}")
         pass
     
     return image
 
 # --- FUNÇÃO DE CONVERSÃO ---
 def convert_pdf_to_docx(file_bytes):
-    # 1. Ler estrutura
-    pdf_plumb = pdfplumber.open(BytesIO(file_bytes))
-    
-    # 2. Imagens
+    # Tenta abrir com pdfplumber para ler texto
+    try:
+        pdf_plumb = pdfplumber.open(BytesIO(file_bytes))
+        has_text_layer = True
+    except:
+        has_text_layer = False
+        pdf_plumb = None
+
     images = convert_from_bytes(file_bytes)
-    
     doc = Document()
     
     section = doc.sections[0]
@@ -215,12 +221,11 @@ def convert_pdf_to_docx(file_bytes):
     section.bottom_margin = Cm(1.0)
 
     for i, img in enumerate(images):
-        if i < len(pdf_plumb.pages):
-            page_plumb = pdf_plumb.pages[i]
-            img = apply_masking(img, page_plumb)
+        # Tenta mascarar se tiver camada de texto
+        if has_text_layer and pdf_plumb and i < len(pdf_plumb.pages):
+            img = apply_masking(img, pdf_plumb.pages[i])
         
         img = img.resize((552, 781))
-        
         img_byte_arr = BytesIO()
         img.save(img_byte_arr, format='JPEG', quality=85, optimize=True)
         img_byte_arr.seek(0)
@@ -261,7 +266,7 @@ if uploaded_files:
                 if len(processed_files) == 1:
                     name, data = processed_files[0]
                     st.download_button(
-                        label=f"📥 Salvar {name}",
+                        label=f"📥 Salvar {name} no Computador",
                         data=data,
                         file_name=name,
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -274,7 +279,7 @@ if uploaded_files:
                             zf.writestr(name, data.getvalue())
                     zip_buffer.seek(0)
                     st.download_button(
-                        label="📥 Salvar Todos (.ZIP)",
+                        label="📥 Salvar Todos (.ZIP) no Computador",
                         data=zip_buffer,
                         file_name="Documentos_SEI_Convertidos.zip",
                         mime="application/zip",
@@ -313,4 +318,4 @@ except:
     pass
 
 # --- RODAPÉ ---
-st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v7.0</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v8.0</div>', unsafe_allow_html=True)
