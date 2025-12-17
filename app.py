@@ -92,7 +92,7 @@ def clean_text(text):
     text = text.replace('\n', ' ').replace('\r', ' ')
     return text.lower().strip()
 
-# --- FUNÇÃO DE MASCARAMENTO (CALIBRADA v9 - CORTE VISUAL DA TABELA) ---
+# --- FUNÇÃO DE MASCARAMENTO (LÓGICA v9.0 - CORTE VISUAL DA TABELA) ---
 def apply_masking(image, pdf_page):
     try:
         # Estratégias de busca de tabela
@@ -175,7 +175,7 @@ def apply_masking(image, pdf_page):
                             l_top = min(tops)
                             l_bottom = max(bottoms)
                             
-                            # Apaga a linha de total inteira visualmente, respeitando o novo corte
+                            # Apaga a linha de total inteira visualmente
                             rect_total = [
                                 table.bbox[0] * scale_x,
                                 l_top * scale_y,
@@ -191,7 +191,7 @@ def apply_masking(image, pdf_page):
     
     return image
 
-# --- FUNÇÃO DE CONVERSÃO ---
+# --- FUNÇÃO DE CONVERSÃO (LÓGICA v9.0 - ANTI PÁGINA EM BRANCO) ---
 def convert_pdf_to_docx(file_bytes):
     try:
         pdf_plumb = pdfplumber.open(BytesIO(file_bytes))
@@ -216,7 +216,7 @@ def convert_pdf_to_docx(file_bytes):
         if has_text_layer and pdf_plumb and i < len(pdf_plumb.pages):
             img = apply_masking(img, pdf_plumb.pages[i])
         
-        # OTIMIZAÇÃO DE TAMANHO (ANTI-PÁGINA EM BRANCO)
+        # Otimização de tamanho
         img = img.resize((595, 842)) 
         
         img_byte_arr = BytesIO()
@@ -286,5 +286,33 @@ if uploaded_files:
             except Exception as e:
                 st.error(f"Erro: {e}")
 
+# --- GUIA VISUAL ---
+st.write("---")
+st.subheader("📚 Guia Rápido: Como inserir no SEI")
+
+col1, col2 = st.columns([0.15, 0.85])
+with col1:
+    try:
+        st.image("icone_sei.png", width=50) 
+    except:
+        st.write("🧩")
+with col2:
+    st.markdown("""
+    *1º Localize o ícone:* No editor do SEI, clique no botão da função *INSERIR CONTEÚDO EXTERNO* (representado pelo ícone ao lado).
+    """)
+
+st.write("")
+
+st.markdown("""
+*2º Configure a inserção:* Na janela que abrir, faça o upload do arquivo Word gerado aqui.
+""")
+
+st.warning("⚠️ *IMPORTANTE:* Certifique-se de deixar todas as caixas de seleção *DESMARCADAS*.")
+
+try:
+    st.image("print_sei.png", caption="Exemplo: Deixe as opções desmarcadas.", use_container_width=True)
+except:
+    pass
+
 # --- RODAPÉ ---
-st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v9.0</div>', unsafe_allow_html=True)
+st.markdown('<div class="footer">Developed by Yuri 🚀 | SEI Converter ATA - SGB v8.1</div>', unsafe_allow_html=True)
