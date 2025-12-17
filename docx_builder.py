@@ -4,7 +4,7 @@ from io import BytesIO
 
 import pdfplumber
 
-from pdf_utils import pdf_to_images
+from pdf_utils import pdf_to_images, pdf_to_images_with_pages
 from masking_table_price import apply_table_price_mask
 
 
